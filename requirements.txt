@@ -18,4 +18,3 @@ gymnasium==1.2.1
 pre-commit==4.3.0
 gym==0.26.2 # required for memory_maze
 setuptools<70 # downgrade for tensorboard
-tensorboard==2.17.1

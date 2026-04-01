@@ -1,4 +1,3 @@
-import contextlib
 import io
 import json
 import os
@@ -9,7 +8,6 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn import init as nn_init
-from torch.utils.tensorboard import SummaryWriter
 
 
 class Tee(io.TextIOBase):
@@ -116,10 +114,26 @@ class CudaBenchmark:
 
 
 class Logger:
-    def __init__(self, logdir, filename="metrics.jsonl"):
+    def __init__(self, logdir, filename="metrics.jsonl", wandb_project=None, wandb_run_name=None):
         self._logdir = logdir
         self._filename = filename
-        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
+        self._wandb = None
+        self._wandb_run = None
+        try:
+            import wandb
+            from datetime import datetime
+            date_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            wandb_run_name = f"r2dreamer_{date_time}"
+
+            self._wandb = wandb
+            self._wandb_run = wandb.init(
+                project="r2dreamer" if wandb_project is None else wandb_project,
+                entity="yw511511",
+                name=wandb_run_name,
+                dir=str(logdir),
+            )
+        except ImportError:
+            print("wandb is not installed; continuing with JSONL logging only.")
         self._last_step = None
         self._last_time = None
         self._scalars = {}
@@ -146,27 +160,25 @@ class Logger:
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
         with (self._logdir / self._filename).open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
-        for name, value in scalars:
-            if "/" not in name:
-                self._writer.add_scalar("scalars/" + name, value, step)
-            else:
-                self._writer.add_scalar(name, value, step)
-        for name, value in self._images.items():
-            self._writer.add_image(name, value, step)
-        for name, value in self._videos.items():
-            name = name if isinstance(name, str) else name.decode("utf-8")
-            if np.issubdtype(value.dtype, np.floating):
-                value = np.clip(255 * value, 0, 255).astype(np.uint8)
-            B, T, H, W, C = value.shape
-            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
-        for name, value in self._histograms.items():
-            self._writer.add_histogram(name, value, step)
-
-        self._writer.flush()
+        if self._wandb_run is not None:
+            wandb_payload = {name: value for name, value in scalars}
+            for name, value in self._images.items():
+                wandb_payload[name] = self._wandb.Image(np.array(value))
+            for name, value in self._videos.items():
+                video = np.array(value)
+                if np.issubdtype(video.dtype, np.floating):
+                    video = np.clip(255 * video, 0, 255).astype(np.uint8)
+                if video.ndim == 5:
+                    b, t, h, w, c = video.shape
+                    video = video.transpose(0, 1, 4, 2, 3).reshape((b, t, c, h, w))
+                wandb_payload[name] = self._wandb.Video(video, fps=16)
+            for name, value in self._histograms.items():
+                wandb_payload[name] = self._wandb.Histogram(np.array(value))
+            self._wandb.log(wandb_payload, step=step)
         self._scalars = {}
         self._images = {}
         self._videos = {}
+        self._histograms = {}
 
     def _compute_fps(self, step):
         if self._last_step is None:
@@ -180,52 +192,19 @@ class Logger:
         return steps / duration
 
     def log_hydra_config(self, config, name="config", step=0, log_hparams=False, hparams_run_name="."):
-        """
-        Log a Hydra/OmegaConf config to TensorBoard:
-          - as YAML text under "{name}/yaml"
-          - as flattened hparams to the HParams plugin
-        """
-        # 1) Log YAML to Text plugin
-        yaml_str = None
         try:
-            from omegaconf import (
-                OmegaConf,  # local import to avoid hard dependency at module import
-            )
-
-            yaml_str = OmegaConf.to_yaml(config, resolve=True)
+            from omegaconf import OmegaConf
         except ImportError:
-            # Fallback to string representation
-            yaml_str = str(config)
-        self._writer.add_text(f"{name}/yaml", f"```yaml\n{yaml_str}\n```", step)
+            return
 
-        # 2) Log flattened hparams to HParams plugin
-        flat = {}
         container = None
         try:
-            from omegaconf import OmegaConf  # local import again
-
             container = OmegaConf.to_container(config, resolve=True)
         except Exception:
             container = None
 
-        if log_hparams and container is not None:
-
-            def _flatten(prefix, obj):
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        _flatten(f"{prefix}.{k}" if prefix else k, v)
-                elif isinstance(obj, (list, tuple)):
-                    flat[prefix] = str(obj)
-                elif isinstance(obj, (int, float, bool, str)) or obj is None:
-                    flat[prefix] = obj if obj is not None else "null"
-                else:
-                    flat[prefix] = str(obj)
-
-            _flatten("", container)
-            # add_hparams requires a non-empty metrics dict
-            with contextlib.suppress(TypeError):
-                # Avoid creating a timestamped subdirectory by specifying run_name (PyTorch >= 1.14)
-                self._writer.add_hparams(flat, {"_": 0}, run_name=hparams_run_name)
+        if self._wandb_run is not None and container is not None:
+            self._wandb.config.update(container, allow_val_change=True)
 
 
 def convert(value, precision=32):
