@@ -24,6 +24,11 @@ class Buffer:
         # (B, ...) -> (B, 1, ...)
         self._buffer.extend(data.unsqueeze(1))
 
+    def add_episode(self, data):
+        # This is a single episode TensorDict with batch size (T, ...).
+        # Lift it to (1, T, ...) so ReplayBuffer keeps episode structure.
+        self._buffer.extend(data.unsqueeze(0))
+
     def sample(self):
         sample_td, info = self._buffer.sample(return_info=True)
         # The sampler returns a flattened batch of length B*(T+1).

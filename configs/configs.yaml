@@ -24,6 +24,17 @@ buffer:
   device: ${device}
   storage_device: 'cuda:0'
 
+dataset:
+  offline: False
+  path: null
+  format: auto
+  eval_episode_num: 0
+  action_space:
+    kind: auto
+    shape: null
+    low: -1.0
+    high: 1.0
+
 trainer:
   steps: ${env.steps}
   pretrain: 0

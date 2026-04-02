@@ -1,3 +1,6 @@
+# Tests
+/test/*_outputs
+
 # Logs / artifacts
 logdir/
 *.hydra/

@@ -6,6 +6,7 @@ import warnings
 import hydra
 import torch
 
+from datasets import make_dummy_envs
 import tools
 from buffer import Buffer
 from dreamer import Dreamer
@@ -39,7 +40,10 @@ def main(config):
     replay_buffer = Buffer(config.buffer)
 
     print("Create envs.")
-    train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
+    if config.dataset.offline:
+        train_envs, eval_envs, obs_space, act_space = make_dummy_envs(config, replay_buffer)
+    else:
+        train_envs, eval_envs, obs_space, act_space = make_envs(config.env)
 
     print("Simulate agent.")
     agent = Dreamer(
@@ -48,7 +52,15 @@ def main(config):
         act_space,
     ).to(config.device)
 
-    policy_trainer = OnlineTrainer(config.trainer, replay_buffer, logger, logdir, train_envs, eval_envs)
+    policy_trainer = OnlineTrainer(
+        config.trainer,
+        replay_buffer,
+        logger,
+        logdir,
+        train_envs,
+        eval_envs,
+        offline=bool(config.dataset.offline),
+    )
     policy_trainer.begin(agent)
 
     items_to_save = {

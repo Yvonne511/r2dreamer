@@ -29,6 +29,7 @@ class Dreamer(nn.Module):
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
+        self.train_reward = bool(config.train_reward)
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
@@ -427,7 +428,11 @@ class Dreamer(nn.Module):
             raise NotImplementedError
 
         # reward and continue
-        losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        replay_reward = to_f32(data["reward"])
+        if self.train_reward:
+            losses["rew"] = torch.mean(-self.reward(feat).log_prob(replay_reward))
+        else:
+            replay_reward = torch.zeros_like(replay_reward)
         cont = 1.0 - to_f32(data["is_terminal"])
         losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
         # log
@@ -445,7 +450,10 @@ class Dreamer(nn.Module):
         imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
         # (B*T, T_imag, 1)
-        imag_reward = self._frozen_reward(imag_feat).mode()
+        if self.train_reward:
+            imag_reward = self._frozen_reward(imag_feat).mode()
+        else:
+            imag_reward = torch.zeros(*imag_feat.shape[:2], 1, device=imag_feat.device, dtype=torch.float32)
         # (B*T, T_imag, 1)  probability of continuation
         imag_cont = self._frozen_cont(imag_feat).mean
         # (B*T, T_imag, 1)
@@ -467,17 +475,25 @@ class Dreamer(nn.Module):
         # (B*T, T_imag-1, 1)
         logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
         entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        losses["policy"] = torch.mean(weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy))
+        if self.train_reward:
+            losses["policy"] = torch.mean(
+                weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)
+            )
+
+        if self._loss_scales.get("bc", 0.0) > 0.0:
+            replay_policy = self.actor(feat.detach())
+            losses["bc"] = torch.mean(-replay_policy.log_prob(data["action"]))
 
         imag_value_dist = self.value(imag_feat)
         # (B*T, T_imag, 1)
         tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-        losses["value"] = torch.mean(
-            weight[:, :-1].detach()
-            * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
-                :, :-1
-            ].unsqueeze(-1)
-        )
+        if self.train_reward:
+            losses["value"] = torch.mean(
+                weight[:, :-1].detach()
+                * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
+                    :, :-1
+                ].unsqueeze(-1)
+            )
         # log
         ret_normed = (ret - ret_offset) / ret_scale
         metrics["ret"] = torch.mean(ret_normed)
@@ -498,7 +514,7 @@ class Dreamer(nn.Module):
         last, term, reward = (
             to_f32(data["is_last"]),
             to_f32(data["is_terminal"]),
-            to_f32(data["reward"]),
+            replay_reward,
         )
         feat = self.rssm.get_feat(post_stoch, post_deter)
         boot = ret[:, 0].reshape(B, T, 1)
@@ -511,12 +527,13 @@ class Dreamer(nn.Module):
 
         # Keep this attached to the world model so gradients can flow through
         value_dist = self.value(feat)
-        losses["repval"] = torch.mean(
-            weight[:, :-1]
-            * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[:, :-1].unsqueeze(
-                -1
+        if self.train_reward:
+            losses["repval"] = torch.mean(
+                weight[:, :-1]
+                * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[
+                    :, :-1
+                ].unsqueeze(-1)
             )
-        )
         # log
         metrics.update(tools.tensorstats(ret, "ret_replay"))
         metrics.update(tools.tensorstats(value, "value_replay"))

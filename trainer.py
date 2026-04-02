@@ -4,11 +4,12 @@ import tools
 
 
 class OnlineTrainer:
-    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs):
+    def __init__(self, config, replay_buffer, logger, logdir, train_envs, eval_envs, offline=False):
         self.replay_buffer = replay_buffer
         self.logger = logger
         self.train_envs = train_envs
         self.eval_envs = eval_envs
+        self.offline = bool(offline)
         self.steps = int(config.steps)
         self.pretrain = int(config.pretrain)
         self.eval_every = int(config.eval_every)
@@ -16,7 +17,9 @@ class OnlineTrainer:
         self.video_pred_log = bool(config.video_pred_log)
         self.params_hist_log = bool(config.params_hist_log)
         self.batch_length = int(config.batch_length)
+        self.batch_size = int(config.batch_size)
         batch_steps = int(config.batch_size * config.batch_length)
+        self._batch_steps = batch_steps
         # train_ratio is based on data steps rather than environment steps.
         self._updates_needed = tools.Every(batch_steps / config.train_ratio * config.action_repeat)
         self._should_pretrain = tools.Once()
@@ -33,6 +36,8 @@ class OnlineTrainer:
         """
         print("Evaluating the policy...")
         envs = self.eval_envs
+        if envs is None:
+            return
         agent.eval()
         # (B,)
         done = torch.ones(envs.env_num, dtype=torch.bool, device=agent.device)
@@ -104,6 +109,10 @@ class OnlineTrainer:
         execution. Environments are stepped on CPU, observations are pinned,
         then transferred to GPU with non_blocking=True.
         """
+        if self.offline:
+            self._begin_offline(agent)
+            return
+
         envs = self.train_envs
         video_cache = []
         step = self.replay_buffer.count() * self._action_repeat
@@ -190,3 +199,38 @@ class OnlineTrainer:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
                     self.logger.write(step, fps=True)
+
+    def _begin_offline(self, agent):
+        if self.replay_buffer.count() == 0:
+            raise ValueError("Offline training requested but replay buffer is empty.")
+
+        step = 0
+        update_count = 0
+        train_metrics = {}
+        while step < self.steps:
+            if self._should_eval(step) and self.eval_episode_num > 0 and self.eval_envs is not None:
+                self.eval(agent, step)
+
+            if self._should_pretrain():
+                update_num = max(self.pretrain, 1)
+            else:
+                update_num = 1
+
+            for _ in range(update_num):
+                train_metrics = agent.update(self.replay_buffer)
+
+            update_count += update_num
+            step += update_num * self._batch_steps * self._action_repeat
+
+            if self._should_log(step):
+                for name, value in train_metrics.items():
+                    value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
+                    self.logger.scalar(f"train/{name}", value)
+                self.logger.scalar("train/opt/updates", update_count)
+                if self.video_pred_log:
+                    data, _, initial = self.replay_buffer.sample()
+                    self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                if self.params_hist_log:
+                    for name, param in agent._named_params.items():
+                        self.logger.histogram(name, tools.to_np(param))
+                self.logger.write(step, fps=True)
