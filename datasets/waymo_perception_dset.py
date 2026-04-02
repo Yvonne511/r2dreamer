@@ -402,7 +402,7 @@ def make_waymo_perception_dataloader(dataset_config, dataset=None):
         batch_size=1,
         shuffle=True,
         num_workers=2,
-        collate_fn=_collate_single,
+        multiprocessing_context="spawn",
     )
 
 def _flag(time_dim, first=False, last=False):
@@ -436,6 +436,3 @@ def _normalize_image_size(value):
 
 def _episode_to_torch(episode):
     return {key: torch.from_numpy(np.ascontiguousarray(value)) for key, value in episode.items()}
-
-def _collate_single(batch):
-    return batch[0]
