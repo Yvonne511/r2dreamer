@@ -13,6 +13,7 @@ Usage:
 
 from pathlib import Path
 
+import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -97,17 +98,10 @@ def iter_segment_frames(segment_path: Path, tf, open_dataset, max_frames=None):
 		if max_frames is not None and frame_idx + 1 >= int(max_frames):
 			break
 
-def plot_map_features(frame, save_path: Path, ego_trajectory=None):
-	"""Plot lane/map geometry from frame.map_features and save as PNG.
 
-	Structure notes:
-	- each entry in frame.map_features has a oneof named "feature_data"
-	- we dispatch by feature_data type and plot XY coordinates in world frame
-	- ego_trajectory is optional: np.ndarray shape (T, 2) with global XY per frame
-	"""
-	fig, ax = plt.subplots(figsize=(10, 10), dpi=120)
-
-	for feat in frame.map_features:
+def _plot_feature_geometry(ax, map_features):
+	"""Draw static map feature geometry onto an axis."""
+	for feat in map_features:
 		t = feat.WhichOneof("feature_data")
 
 		if t == "lane":
@@ -147,6 +141,17 @@ def plot_map_features(frame, save_path: Path, ego_trajectory=None):
 				poly = np.vstack([poly, poly[0]])
 				ax.plot(poly[:, 0], poly[:, 1], color="red", linewidth=1.5)
 
+def plot_map_features(frame, save_path: Path, ego_trajectory=None):
+	"""Plot lane/map geometry from frame.map_features and save as PNG.
+
+	Structure notes:
+	- each entry in frame.map_features has a oneof named "feature_data"
+	- we dispatch by feature_data type and plot XY coordinates in world frame
+	- ego_trajectory is optional: np.ndarray shape (T, 2) with global XY per frame
+	"""
+	fig, ax = plt.subplots(figsize=(10, 10), dpi=120)
+	_plot_feature_geometry(ax, frame.map_features)
+
 	# Draw full ego trajectory across frames when provided.
 	if ego_trajectory is not None and len(ego_trajectory) > 0:
 		ego_trajectory = np.asarray(ego_trajectory, dtype=np.float64)
@@ -169,6 +174,124 @@ def plot_map_features(frame, save_path: Path, ego_trajectory=None):
 	save_path.parent.mkdir(parents=True, exist_ok=True)
 	fig.savefig(save_path)
 	plt.close(fig)
+
+def _lidar_boxes_global_corners(frame):
+	"""Convert per-frame lidar boxes from ego frame to global XY box corners."""
+	ego = ego_global_pose_from_frame(frame)
+	transform = ego["transform"]
+	r2 = transform[:2, :2]
+	t2 = transform[:2, 3]
+	ego_yaw = ego["yaw"]
+	boxes = parse_lidar_boxes(frame)[0]
+	polygons = []
+
+	for box in boxes:
+		cx, cy, _cz, length, width, _height, heading = [float(v) for v in box]
+		center_global = r2 @ np.array([cx, cy], dtype=np.float64) + t2
+		theta = ego_yaw + heading
+		c = np.cos(theta)
+		s = np.sin(theta)
+		rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+		half_l = 0.5 * length
+		half_w = 0.5 * width
+		local = np.array(
+			[
+				[half_l, half_w],
+				[half_l, -half_w],
+				[-half_l, -half_w],
+				[-half_l, half_w],
+			],
+			dtype=np.float64,
+		)
+		corners = (local @ rot.T) + center_global
+		corners = np.vstack([corners, corners[0]])
+		polygons.append(corners)
+	return polygons
+
+def plot_map_features_w_lidar(frames, save_path: Path, ego_trajectory=None, fps=10):
+	"""Render a per-segment video with map, moving ego, and moving lidar boxes.
+
+	- Uses static map features from the first frame.
+	- Draws ego trajectory up to current frame.
+	- Draws current frame lidar boxes in global frame.
+	"""
+	if not frames:
+		raise ValueError("Expected at least one frame to render video.")
+
+	save_path.parent.mkdir(parents=True, exist_ok=True)
+	video_path = save_path.with_name(f"{save_path.stem}_ego_lidar.mp4")
+	map_features = frames[0].map_features
+
+	if ego_trajectory is None:
+		ego_poses = [ego_global_pose_from_frame(frame) for frame in frames]
+		ego_trajectory = np.asarray([[pose["x"], pose["y"]] for pose in ego_poses], dtype=np.float64)
+	else:
+		ego_trajectory = np.asarray(ego_trajectory, dtype=np.float64)
+
+	if len(ego_trajectory) == 0:
+		raise ValueError("ego_trajectory must contain at least one point.")
+
+	writer = None
+	fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+
+	# Stable axis limits reduce jitter in the video.
+	x_min = float(np.min(ego_trajectory[:, 0])) - 30.0
+	x_max = float(np.max(ego_trajectory[:, 0])) + 30.0
+	y_min = float(np.min(ego_trajectory[:, 1])) - 30.0
+	y_max = float(np.max(ego_trajectory[:, 1])) + 30.0
+
+	for idx, frame in enumerate(frames):
+		fig, ax = plt.subplots(figsize=(10, 10), dpi=120)
+		_plot_feature_geometry(ax, map_features)
+
+		traj_now = ego_trajectory[: idx + 1]
+		ax.plot(traj_now[:, 0], traj_now[:, 1], color="cyan", linewidth=2.0, alpha=0.9)
+		ax.plot(traj_now[0, 0], traj_now[0, 1], marker="s", color="cyan", markersize=5)
+		ax.plot(traj_now[-1, 0], traj_now[-1, 1], marker="o", color="cyan", markersize=6)
+
+		ego_now = ego_global_pose_from_frame(frame)
+		ex = ego_now["x"]
+		ey = ego_now["y"]
+		yaw = ego_now["yaw"]
+		arrow_len = 4.0
+		ax.arrow(
+			ex,
+			ey,
+			arrow_len * np.cos(yaw),
+			arrow_len * np.sin(yaw),
+			width=0.15,
+			head_width=0.9,
+			head_length=1.2,
+			color="cyan",
+			length_includes_head=True,
+		)
+
+		for poly in _lidar_boxes_global_corners(frame):
+			ax.plot(poly[:, 0], poly[:, 1], color="yellow", linewidth=1.0, alpha=0.9)
+
+		ax.set_title(f"Waymo map + ego + lidar: {save_path.stem} | frame {idx}")
+		ax.set_xlabel("x (m)")
+		ax.set_ylabel("y (m)")
+		ax.set_aspect("equal", adjustable="box")
+		ax.set_xlim(x_min, x_max)
+		ax.set_ylim(y_min, y_max)
+		ax.grid(alpha=0.25)
+		fig.tight_layout()
+
+		fig.canvas.draw()
+		rgb = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+		rgb = rgb.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+		bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+
+		if writer is None:
+			h, w = bgr.shape[:2]
+			writer = cv2.VideoWriter(str(video_path), fourcc, float(fps), (w, h))
+		writer.write(bgr)
+		plt.close(fig)
+
+	if writer is not None:
+		writer.release()
+	return video_path
 
 def decode_camera_images(frame, tf, open_dataset):
 	"""Return decoded images as {camera_name: np.ndarray[H, W, 3] uint8}.
@@ -294,6 +417,9 @@ def main():
 
 	for seg_idx, segment_path in enumerate(segment_paths):
 		frames = list(iter_segment_frames(segment_path, tf, open_dataset, max_frames=MAX_FRAMES))
+		if not frames:
+			print(f"[{seg_idx + 1}/{len(segment_paths)}] skipped empty segment: {segment_path}")
+			continue
 
 		frame = frames[0]
 		segment_id = segment_stem(segment_path)
@@ -302,7 +428,9 @@ def main():
 		ego_poses = [ego_global_pose_from_frame(f) for f in frames]
 		ego_trajectory = np.asarray([[pose["x"], pose["y"]] for pose in ego_poses], dtype=np.float64)
 		plot_map_features(frame, map_path, ego_trajectory=ego_trajectory)
+		video_path = plot_map_features_w_lidar(frames, map_path, ego_trajectory=ego_trajectory, fps=10)
 		print(f"[{seg_idx + 1}/{len(segment_paths)}] saved map plot: {map_path}")
+		print(f"[{seg_idx + 1}/{len(segment_paths)}] saved video: {video_path}")
 
 		# Keep detailed inspection for the first segment to avoid stopping repeatedly.
 		if seg_idx == 0:
