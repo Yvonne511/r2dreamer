@@ -208,9 +208,6 @@ class OnlineTrainer:
         update_count = 0
         train_metrics = {}
         while step < self.steps:
-            if self._should_eval(step) and self.eval_episode_num > 0 and self.eval_envs is not None:
-                self.eval(agent, step)
-
             if self._should_pretrain():
                 update_num = max(self.pretrain, 1)
             else:

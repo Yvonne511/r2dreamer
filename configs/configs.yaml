@@ -5,17 +5,19 @@ defaults:
   - override hydra/job_logging: disabled
   - _self_
 
-logdir: logdir/${now:%Y-%m-%d}/${now:%H-%M-%S}
+ckpt_base_path: /scratch/yw4142/checkpoints/ad/LatentDrive
+logdir: ${ckpt_base_path}/${now:%Y-%m-%d}/${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
+offline: False
 
 hydra:
   run:
     dir: ${logdir}
 
-batch_size: 16
-batch_length: 64
+batch_size: 2
+batch_length: 24
 
 buffer:
   batch_size: ${batch_size}
@@ -23,17 +25,6 @@ buffer:
   max_size: 5e5
   device: ${device}
   storage_device: 'cuda:0'
-
-dataset:
-  offline: False
-  path: null
-  format: auto
-  eval_episode_num: 0
-  action_space:
-    kind: auto
-    shape: null
-    low: -1.0
-    high: 1.0
 
 trainer:
   steps: ${env.steps}
