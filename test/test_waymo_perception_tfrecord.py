@@ -19,7 +19,7 @@ import numpy as np
 
 PATH = "/scratch/yw4142/datasets/ad/waymo_open_dataset_v_1_4_3/training"
 OUTPUT_DIR = Path("/home/yw4142/ad/r2dreamer/test/waymo_vis_outputs")
-MAX_FRAMES = 1
+MAX_FRAMES = None  # None means use all frames in each segment.
 ENTER_PDB = True
 
 CAMERA_NAME_TO_LABEL = {
@@ -82,12 +82,28 @@ def load_first_frame(segment_path: Path, tf, open_dataset):
 		return frame
 	raise RuntimeError(f"Segment has no frames: {segment_path}")
 
-def plot_map_features(frame, save_path: Path):
+def iter_segment_frames(segment_path: Path, tf, open_dataset, max_frames=None):
+	"""Yield all frames from one segment TFRecord."""
+	dataset = tf.data.TFRecordDataset(
+		[str(segment_path)],
+		compression_type="",
+		buffer_size=8 << 20,
+		num_parallel_reads=1,
+	)
+	for frame_idx, raw in enumerate(dataset):
+		frame = open_dataset.Frame()
+		frame.ParseFromString(raw.numpy())
+		yield frame
+		if max_frames is not None and frame_idx + 1 >= int(max_frames):
+			break
+
+def plot_map_features(frame, save_path: Path, ego_trajectory=None):
 	"""Plot lane/map geometry from frame.map_features and save as PNG.
 
 	Structure notes:
 	- each entry in frame.map_features has a oneof named "feature_data"
 	- we dispatch by feature_data type and plot XY coordinates in world frame
+	- ego_trajectory is optional: np.ndarray shape (T, 2) with global XY per frame
 	"""
 	fig, ax = plt.subplots(figsize=(10, 10), dpi=120)
 
@@ -131,6 +147,19 @@ def plot_map_features(frame, save_path: Path):
 				poly = np.vstack([poly, poly[0]])
 				ax.plot(poly[:, 0], poly[:, 1], color="red", linewidth=1.5)
 
+	# Draw full ego trajectory across frames when provided.
+	if ego_trajectory is not None and len(ego_trajectory) > 0:
+		ego_trajectory = np.asarray(ego_trajectory, dtype=np.float64)
+		ax.plot(
+			ego_trajectory[:, 0],
+			ego_trajectory[:, 1],
+			color="cyan",
+			linewidth=2.0,
+			alpha=0.9,
+		)
+		ax.plot(ego_trajectory[0, 0], ego_trajectory[0, 1], marker="s", color="cyan", markersize=5)
+		ax.plot(ego_trajectory[-1, 0], ego_trajectory[-1, 1], marker="o", color="cyan", markersize=6)
+
 	ax.set_title(f"Waymo map features: {save_path.stem}")
 	ax.set_xlabel("x (m)")
 	ax.set_ylabel("y (m)")
@@ -165,6 +194,18 @@ def parse_ego_pose(frame):
 	- matrix maps from vehicle frame -> world frame
 	"""
 	return np.asarray(frame.pose.transform, dtype=np.float64).reshape(4, 4)
+
+def ego_global_pose_from_frame(frame):
+	"""Get ego global pose from one frame.
+
+	Waymo frame.pose.transform is world-from-vehicle (4x4), so translation is
+	the global position and yaw comes from the rotation block.
+	"""
+	transform = parse_ego_pose(frame)
+	x = float(transform[0, 3])
+	y = float(transform[1, 3])
+	yaw = float(np.arctan2(transform[1, 0], transform[0, 0]))
+	return {"x": x, "y": y, "yaw": yaw, "transform": transform}
 
 def parse_lidar_boxes(frame):
 	"""Return LiDAR boxes and metadata from frame.laser_labels.
@@ -252,10 +293,15 @@ def main():
 	print(f"Found {len(segment_paths)} segment files under: {PATH}")
 
 	for seg_idx, segment_path in enumerate(segment_paths):
-		frame = load_first_frame(segment_path, tf, open_dataset)
+		frames = list(iter_segment_frames(segment_path, tf, open_dataset, max_frames=MAX_FRAMES))
+
+		frame = frames[0]
 		segment_id = segment_stem(segment_path)
 		map_path = OUTPUT_DIR / f"{segment_id}_map.png"
-		plot_map_features(frame, map_path)
+		# get ego global pose per frame and plot map features in global frame
+		ego_poses = [ego_global_pose_from_frame(f) for f in frames]
+		ego_trajectory = np.asarray([[pose["x"], pose["y"]] for pose in ego_poses], dtype=np.float64)
+		plot_map_features(frame, map_path, ego_trajectory=ego_trajectory)
 		print(f"[{seg_idx + 1}/{len(segment_paths)}] saved map plot: {map_path}")
 
 		# Keep detailed inspection for the first segment to avoid stopping repeatedly.
