@@ -1,0 +1,21 @@
+task: waymo_perception_offline
+steps: 1.01e6
+
+size: [64, 64]
+encoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+decoder:
+  mlp_keys: '$^'
+  cnn_keys: 'image'
+
+dataset:
+  _target_: datasets.waymo_motion_dset.WaymoMotionDataset
+  path: /scratch/yw4142/datasets/ad/waymo_pufferdrive
+  n_rollout: null
+  image_size: null
+  window_size: ${batch_length} # +1
+  frame_skip: 1
+  wheelbase_m: 2.8
+  max_steer_rad: 0.7
+  
