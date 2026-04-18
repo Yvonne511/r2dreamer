@@ -26,15 +26,34 @@ class Dreamer(nn.Module):
         self.imag_horizon = int(config.imag_horizon)
         self.horizon = int(config.horizon)
         self.lamb = float(config.lamb)
+        self.train_wm_only = bool(config.train_wm_only)
         self.return_ema = networks.ReturnEMA(device=self.device)
         self.act_dim = act_space.n if hasattr(act_space, "n") else sum(act_space.shape)
         self.rep_loss = str(config.rep_loss)
-        self.train_reward = bool(config.train_reward)
 
         # World model components
         shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
+        self.reconstruct_reward = bool(config.reconstruct_reward)
+        self.reward_target_keys = tuple(sorted(key for key in shapes if key.startswith("reward_")))
+        self.binary_reward_target_keys = frozenset({"reward_collision", "reward_road_boundary"})
+        if self.reconstruct_reward and self.reward_target_keys:
+            reward_shapes = {key: shapes[key] for key in self.reward_target_keys}
+            reward_verifier_config = copy.deepcopy(config.reward_verifier)
+            reward_dist_by_key = {}
+            for key in self.reward_target_keys:
+                dist_cfg = copy.deepcopy(config.reward_verifier.dist)
+                dist_cfg.name = "binary" if key in self.binary_reward_target_keys else "mse"
+                reward_dist_by_key[key] = dist_cfg
+            self.reward_verifier = networks.DictMLPHeads(
+                reward_verifier_config,
+                self.embed_size,
+                reward_shapes,
+                dist_by_key=reward_dist_by_key,
+            )
+        else:
+            self.reward_verifier = None
         self.rssm = rssm.RSSM(
             config.rssm,
             self.embed_size,
@@ -75,6 +94,8 @@ class Dreamer(nn.Module):
             "cont": self.cont,
             "encoder": self.encoder,
         }
+        if self.reward_verifier is not None:
+            modules["reward_verifier"] = self.reward_verifier
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -123,6 +144,10 @@ class Dreamer(nn.Module):
                 "ema_encoder": self._ema_encoder,
                 "ema_obs_proj": self._ema_obs_proj,
             })
+        elif self.rep_loss == "policy_supervised":
+            self.bc = networks.MLPHead(config.actor, self.rssm.feat_size)
+            modules.update({"bc": self.bc})
+
         # count number of parameters in each module
         for key, module in modules.items():
             if isinstance(module, nn.Parameter):
@@ -221,6 +246,15 @@ class Dreamer(nn.Module):
             param_new.data = param_orig.data
             param_new.requires_grad_(False)
 
+        if self.rep_loss == "policy_supervised":
+            self._frozen_bc = copy.deepcopy(self.bc)
+            for (name_orig, param_orig), (name_new, param_new) in zip(
+                self.bc.named_parameters(), self._frozen_bc.named_parameters()
+            ):
+                assert name_orig == name_new
+                param_new.data = param_orig.data
+                param_new.requires_grad_(False)
+
         self._frozen_value = copy.deepcopy(self.value)
         for (name_orig, param_orig), (name_new, param_new) in zip(
             self.value.named_parameters(), self._frozen_value.named_parameters()
@@ -242,6 +276,24 @@ class Dreamer(nn.Module):
         # Re-establish shared memory after moving the model to a new device
         self.clone_and_freeze()
         return self
+
+    def _barlow_loss(self, feat, embed):
+        """Compute the Barlow Twins objective in fp32 for numerical stability."""
+        sample_count = max(int(feat.shape[0] * feat.shape[1]), 1)
+        with autocast(device_type=self.device.type, enabled=False):
+            x1 = self.prj(to_f32(feat).reshape(sample_count, -1))
+            x2 = to_f32(embed).reshape(sample_count, -1).detach()
+
+            x1 = x1 - x1.mean(dim=0, keepdim=True)
+            x2 = x2 - x2.mean(dim=0, keepdim=True)
+            x1 = x1 / x1.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+            x2 = x2 / x2.std(dim=0, unbiased=False, keepdim=True).clamp_min(1e-6)
+
+            c = torch.matmul(x1.T, x2) / float(sample_count)
+            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
+            off_diag_mask = ~torch.eye(c.shape[0], dtype=torch.bool, device=c.device)
+            redundancy_loss = c[off_diag_mask].pow(2).sum()
+            return invariance_loss + self.barlow_lambd * redundancy_loss
 
     @torch.no_grad()
     def act(self, obs, state, eval=False):
@@ -313,7 +365,8 @@ class Dreamer(nn.Module):
         data, index, initial = replay_buffer.sample()
         torch.compiler.cudagraph_mark_step_begin()
         p_data = self.preprocess(data)
-        self._update_slow_target()
+        if not self.train_wm_only:
+            self._update_slow_target()
         if self.rep_loss == "dreamerpro":
             self.ema_update()
         metrics = {}
@@ -354,9 +407,9 @@ class Dreamer(nn.Module):
         -----
         This function computes:
         1) World model loss (dynamics + representation)
-        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro)
-        3) Imagination rollouts for actor-critic updates
-        4) Replay-based value learning
+        2) Optional representation loss variants (Dreamer, R2-Dreamer, InfoNCE, DreamerPro, BC supervision)
+        3) Optional imagination rollouts for actor-critic updates
+        4) Optional replay-based value learning
         """
         # data: dict of (B, T, *), initial: (stoch: (B, S, K), deter: (B, D))
         losses = {}
@@ -382,21 +435,7 @@ class Dreamer(nn.Module):
             }
             losses.update(recon_losses)
         elif self.rep_loss == "r2dreamer":
-            # R2-Dreamer: Barlow Twins style redundancy reduction between latent features and encoder embeddings.
-            # Flatten batch/time dims for a single cross-correlation matrix.
-            # (B, T, F) -> (B*T, F)
-            x1 = self.prj(feat[:, :].reshape(B * T, -1))
-            # (B, T, E) -> (B*T, E)
-            x2 = embed.reshape(B * T, -1).detach()  # this detach is important
-
-            x1_norm = (x1 - x1.mean(0)) / (x1.std(0) + 1e-8)
-            x2_norm = (x2 - x2.mean(0)) / (x2.std(0) + 1e-8)
-
-            c = torch.mm(x1_norm.T, x2_norm) / (B * T)
-            invariance_loss = (torch.diagonal(c) - 1.0).pow(2).sum()
-            off_diag_mask = ~torch.eye(x1.shape[-1], dtype=torch.bool, device=x1.device)
-            redundancy_loss = c[off_diag_mask].pow(2).sum()
-            losses["barlow"] = invariance_loss + self.barlow_lambd * redundancy_loss
+            losses["barlow"] = self._barlow_loss(feat, embed)
         elif self.rep_loss == "infonce":
             # Contrastive (InfoNCE) objective between projected latent features and encoder embeddings.
             # (B, T, F) -> (B*T, F)
@@ -424,120 +463,119 @@ class Dreamer(nn.Module):
             )
             proto_losses = self.proto_loss(post_stoch_aug, post_deter_aug, embed_aug, ema_proj)
             losses.update(proto_losses)
+        elif self.rep_loss == "policy_supervised":
+            losses["bc"] = torch.mean(-self.bc(feat).log_prob(to_f32(data['action'])))
         else:
             raise NotImplementedError
 
         # reward and continue
-        replay_reward = to_f32(data["reward"])
-        if self.train_reward:
-            losses["rew"] = torch.mean(-self.reward(feat).log_prob(replay_reward))
-        else:
-            replay_reward = torch.zeros_like(replay_reward)
-        cont = 1.0 - to_f32(data["is_terminal"])
-        losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        # losses["rew"] = torch.mean(-self.reward(feat).log_prob(to_f32(data["reward"])))
+        # cont = 1.0 - to_f32(data["is_terminal"])
+        # losses["con"] = torch.mean(-self.cont(feat).log_prob(cont))
+        if self.reward_verifier is not None:
+            reward_losses = []
+            for key, dist in self.reward_verifier(embed.detach()).items():
+                target = to_f32(data[key])
+                if key in self.binary_reward_target_keys:
+                    target = to_f32(target != 0)
+                reward_loss = torch.mean(-dist.log_prob(target))
+                reward_losses.append(reward_loss)
+                metrics[f"loss/recon_reward_{key}"] = reward_loss
+            losses["recon_reward"] = torch.stack(reward_losses).mean()
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
 
-        # === Imagination rollout for actor-critic ===
-        # (B*T, S, K), (B*T, D)
-        start = (
-            post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
-            post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
-        )
-        # (B, T, ...) -> (B*T, ...)
-        imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
-        imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
+        if not self.train_wm_only:
+            # === Imagination rollout for actor-critic ===
+            # (B*T, S, K), (B*T, D)
+            start = (
+                post_stoch.reshape(-1, *post_stoch.shape[2:]).detach(),
+                post_deter.reshape(-1, *post_deter.shape[2:]).detach(),
+            )
+            # (B, T, ...) -> (B*T, ...)
+            imag_feat, imag_action = self._imagine(start, self.imag_horizon + 1)
+            imag_feat, imag_action = imag_feat.detach(), imag_action.detach()
 
-        # (B*T, T_imag, 1)
-        if self.train_reward:
+            # (B*T, T_imag, 1)
             imag_reward = self._frozen_reward(imag_feat).mode()
-        else:
-            imag_reward = torch.zeros(*imag_feat.shape[:2], 1, device=imag_feat.device, dtype=torch.float32)
-        # (B*T, T_imag, 1)  probability of continuation
-        imag_cont = self._frozen_cont(imag_feat).mean
-        # (B*T, T_imag, 1)
-        imag_value = self._frozen_value(imag_feat).mode()
-        imag_slow_value = self._frozen_slow_value(imag_feat).mode()
-        disc = 1 - 1 / self.horizon
-        # (B*T, T_imag, 1)
-        weight = torch.cumprod(imag_cont * disc, dim=1)
-        last = torch.zeros_like(imag_cont)
-        term = 1 - imag_cont
-        ret = self._lambda_return(
-            last, term, imag_reward, imag_value, imag_value, disc, self.lamb
-        )  # (B*T, T_imag-1, 1)
-        ret_offset, ret_scale = self.return_ema(ret)
-        # (B*T, T_imag-1, 1)
-        adv = (ret - imag_value[:, :-1]) / ret_scale
+            # (B*T, T_imag, 1)  probability of continuation
+            imag_cont = self._frozen_cont(imag_feat).mean
+            # (B*T, T_imag, 1)
+            imag_value = self._frozen_value(imag_feat).mode()
+            imag_slow_value = self._frozen_slow_value(imag_feat).mode()
+            disc = 1 - 1 / self.horizon
+            # (B*T, T_imag, 1)
+            weight = torch.cumprod(imag_cont * disc, dim=1)
+            last = torch.zeros_like(imag_cont)
+            term = 1 - imag_cont
+            ret = self._lambda_return(
+                last, term, imag_reward, imag_value, imag_value, disc, self.lamb
+            )  # (B*T, T_imag-1, 1)
+            ret_offset, ret_scale = self.return_ema(ret)
+            # (B*T, T_imag-1, 1)
+            adv = (ret - imag_value[:, :-1]) / ret_scale
 
-        policy = self.actor(imag_feat)
-        # (B*T, T_imag-1, 1)
-        logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
-        entropy = policy.entropy()[:, :-1].unsqueeze(-1)
-        if self.train_reward:
+            policy = self.actor(imag_feat)
+            # (B*T, T_imag-1, 1)
+            logpi = policy.log_prob(imag_action)[:, :-1].unsqueeze(-1)
+            entropy = policy.entropy()[:, :-1].unsqueeze(-1)
             losses["policy"] = torch.mean(
                 weight[:, :-1].detach() * -(logpi * adv.detach() + self.act_entropy * entropy)
             )
 
-        if self._loss_scales.get("bc", 0.0) > 0.0:
-            replay_policy = self.actor(feat.detach())
-            losses["bc"] = torch.mean(-replay_policy.log_prob(data["action"]))
-
-        imag_value_dist = self.value(imag_feat)
-        # (B*T, T_imag, 1)
-        tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
-        if self.train_reward:
+            imag_value_dist = self.value(imag_feat)
+            # (B*T, T_imag, 1)
+            tar_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
             losses["value"] = torch.mean(
                 weight[:, :-1].detach()
                 * (-imag_value_dist.log_prob(tar_padded.detach()) - imag_value_dist.log_prob(imag_slow_value.detach()))[
                     :, :-1
                 ].unsqueeze(-1)
             )
-        # log
-        ret_normed = (ret - ret_offset) / ret_scale
-        metrics["ret"] = torch.mean(ret_normed)
-        metrics["ret_005"] = self.return_ema.ema_vals[0]
-        metrics["ret_095"] = self.return_ema.ema_vals[1]
-        metrics["adv"] = torch.mean(adv)
-        metrics["adv_std"] = torch.std(adv)
-        metrics["con"] = torch.mean(imag_cont)
-        metrics["rew"] = torch.mean(imag_reward)
-        metrics["val"] = torch.mean(imag_value)
-        metrics["tar"] = torch.mean(ret)
-        metrics["slowval"] = torch.mean(imag_slow_value)
-        metrics["weight"] = torch.mean(weight)
-        metrics["action_entropy"] = torch.mean(entropy)
-        metrics.update(tools.tensorstats(imag_action, "action"))
+            # log
+            ret_normed = (ret - ret_offset) / ret_scale
+            metrics["ret"] = torch.mean(ret_normed)
+            metrics["ret_005"] = self.return_ema.ema_vals[0]
+            metrics["ret_095"] = self.return_ema.ema_vals[1]
+            metrics["adv"] = torch.mean(adv)
+            metrics["adv_std"] = torch.std(adv)
+            metrics["con"] = torch.mean(imag_cont)
+            metrics["rew"] = torch.mean(imag_reward)
+            metrics["val"] = torch.mean(imag_value)
+            metrics["tar"] = torch.mean(ret)
+            metrics["slowval"] = torch.mean(imag_slow_value)
+            metrics["weight"] = torch.mean(weight)
+            metrics["action_entropy"] = torch.mean(entropy)
+            metrics.update(tools.tensorstats(imag_action, "action"))
 
-        # === Replay-based value learning (keep gradients through world model) ===
-        last, term, reward = (
-            to_f32(data["is_last"]),
-            to_f32(data["is_terminal"]),
-            replay_reward,
-        )
-        feat = self.rssm.get_feat(post_stoch, post_deter)
-        boot = ret[:, 0].reshape(B, T, 1)
-        value = self._frozen_value(feat).mode()
-        slow_value = self._frozen_slow_value(feat).mode()
-        disc = 1 - 1 / self.horizon
-        weight = 1.0 - last
-        ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
-        ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
+            # === Replay-based value learning (keep gradients through world model) ===
+            last, term, reward = (
+                to_f32(data["is_last"]),
+                to_f32(data["is_terminal"]),
+                to_f32(data["reward"]),
+            )
+            feat = self.rssm.get_feat(post_stoch, post_deter)
+            boot = ret[:, 0].reshape(B, T, 1)
+            value = self._frozen_value(feat).mode()
+            slow_value = self._frozen_slow_value(feat).mode()
+            disc = 1 - 1 / self.horizon
+            weight = 1.0 - last
+            ret = self._lambda_return(last, term, reward, value, boot, disc, self.lamb)
+            ret_padded = torch.cat([ret, 0 * ret[:, -1:]], 1)
 
-        # Keep this attached to the world model so gradients can flow through
-        value_dist = self.value(feat)
-        if self.train_reward:
+            # Keep this attached to the world model so gradients can flow through
+            value_dist = self.value(feat)
             losses["repval"] = torch.mean(
                 weight[:, :-1]
-                * (-value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach()))[
-                    :, :-1
-                ].unsqueeze(-1)
+                * (
+                    -value_dist.log_prob(ret_padded.detach()) - value_dist.log_prob(slow_value.detach())
+                )[:, :-1].unsqueeze(-1)
             )
-        # log
-        metrics.update(tools.tensorstats(ret, "ret_replay"))
-        metrics.update(tools.tensorstats(value, "value_replay"))
-        metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
+            # log
+            metrics.update(tools.tensorstats(ret, "ret_replay"))
+            metrics.update(tools.tensorstats(value, "value_replay"))
+            metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
         total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
         self._scaler.scale(total_loss).backward()

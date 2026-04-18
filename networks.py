@@ -1,3 +1,4 @@
+import copy
 import math
 import re
 from functools import partial
@@ -104,7 +105,9 @@ class MultiEncoder(nn.Module):
     ):
         super().__init__()
         excluded = ("is_first", "is_last", "is_terminal", "reward")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_")}
+        shapes = {
+            k: v for k, v in shapes.items() if k not in excluded and not k.startswith("log_") and not k.startswith("reward_")
+        }
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Encoder CNN shapes:", self.cnn_shapes)
@@ -145,7 +148,7 @@ class MultiDecoder(nn.Module):
     def __init__(self, config, deter, flat_stoch, shapes):
         super().__init__()
         excluded = ("is_first", "is_last", "is_terminal")
-        shapes = {k: v for k, v in shapes.items() if k not in excluded}
+        shapes = {k: v for k, v in shapes.items() if k not in excluded and not k.startswith("reward_")}
         self.cnn_shapes = {k: v for k, v in shapes.items() if len(v) == 3 and re.match(config.cnn_keys, k)}
         self.mlp_shapes = {k: v for k, v in shapes.items() if len(v) in (1, 2) and re.match(config.mlp_keys, k)}
         print("Decoder CNN shapes:", self.cnn_shapes)
@@ -188,6 +191,23 @@ class MultiDecoder(nn.Module):
             dists.update({key: self._mlp_dist(output) for key, output in zip(self.mlp_shapes.keys(), outputs)})
         return dists
 
+class DictMLPHeads(nn.Module):
+    def __init__(self, config, inp_dim, shapes, dist_by_key=None):
+        super().__init__()
+        self._shapes = {key: tuple(map(int, shape)) for key, shape in shapes.items()}
+        self.heads = nn.ModuleDict()
+        dist_by_key = {} if dist_by_key is None else dist_by_key
+        for key, shape in self._shapes.items():
+            head_cfg = copy.deepcopy(config)
+            if key in dist_by_key:
+                head_cfg.dist = copy.deepcopy(dist_by_key[key])
+            head_cfg.shape = (math.prod(shape),)
+            head_cfg.name = f"{config.name}_{key}"
+            self.heads[key] = MLPHead(head_cfg, inp_dim)
+
+    def forward(self, x):
+        return {key: head(x) for key, head in self.heads.items()}
+
 
 class ConvEncoder(nn.Module):
     def __init__(self, config, input_shape):
@@ -195,16 +215,26 @@ class ConvEncoder(nn.Module):
         act = getattr(torch.nn, config.act)
         h, w, input_ch = input_shape
         self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
+        stride_cfg = getattr(config, "strides", None)
+        if stride_cfg is None:
+            self.strides = (1,) * len(self.depths)
+        else:
+            self.strides = tuple(int(stride) for stride in stride_cfg)
+            if len(self.strides) != len(self.depths):
+                raise ValueError(
+                    f"Encoder stride schedule length {len(self.strides)} "
+                    f"does not match conv depth schedule length {len(self.depths)}."
+                )
         self.kernel_size = int(config.kernel_size)
         in_dim = input_ch
         layers = []
-        for i, depth in enumerate(self.depths):
+        for i, (depth, stride) in enumerate(zip(self.depths, self.strides)):
             layers.append(
                 Conv2dSamePad(
                     in_channels=in_dim,
                     out_channels=depth,
                     kernel_size=self.kernel_size,
-                    stride=1,
+                    stride=stride,
                     bias=True,
                 )
             )
@@ -213,6 +243,8 @@ class ConvEncoder(nn.Module):
                 layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
             layers.append(act())
             in_dim = depth
+            h = (h + stride - 1) // stride
+            w = (w + stride - 1) // stride
             h, w = h // 2, w // 2
 
         self.out_dim = self.depths[-1] * h * w
@@ -356,7 +388,7 @@ class MLPHead(nn.Module):
         elif self._dist_name == "symexp_twohot":
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {"device": torch.device(config.device), "bin_num": int(config.dist.bin_num)}
-        elif self._dist_name in ("binary", "identity"):
+        elif self._dist_name in ("binary", "identity", "symlog_mse", "mse"):
             self.last = nn.Linear(self.mlp.out_dim, config.shape[0], bias=True)
             kwargs = {}
         else:
