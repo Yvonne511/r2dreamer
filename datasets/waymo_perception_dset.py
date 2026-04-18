@@ -18,7 +18,6 @@ MAP_REWARD_KEYS = (
     "reward_lane_center_offset",
     "reward_collision",
     "reward_road_boundary",
-    "reward_cross_stop_line",
 )
 WAYMO_COMPONENT_DIRS = ("camera_image", "lidar_box", "vehicle_pose", "map_features")
 
@@ -44,6 +43,7 @@ LIDAR_BOX_HEADING_COL = "[LiDARBoxComponent].box.heading"
 LIDAR_BOX_TYPE_COL = "[LiDARBoxComponent].type"
 LIDAR_BOX_ID_COL = "key.laser_object_id"
 
+MAP_FEATURE_ID_COL = "key.map_feature_id"
 MAP_FEATURE_TYPE_COL = "[MapFeatureComponent].feature_type"
 MAP_LANE_POLYLINE_X_COL = "[MapFeatureComponent].lane.polyline.x"
 MAP_LANE_POLYLINE_Y_COL = "[MapFeatureComponent].lane.polyline.y"
@@ -53,12 +53,32 @@ MAP_ROAD_LINE_POLYLINE_X_COL = "[MapFeatureComponent].road_line.polyline.x"
 MAP_ROAD_LINE_POLYLINE_Y_COL = "[MapFeatureComponent].road_line.polyline.y"
 MAP_STOP_SIGN_POSITION_X_COL = "[MapFeatureComponent].stop_sign.position.x"
 MAP_STOP_SIGN_POSITION_Y_COL = "[MapFeatureComponent].stop_sign.position.y"
+MAP_STOP_SIGN_LANES_COL = "[MapFeatureComponent].stop_sign.lane"
 MAP_CROSSWALK_POLYGON_X_COL = "[MapFeatureComponent].crosswalk.polygon.x"
 MAP_CROSSWALK_POLYGON_Y_COL = "[MapFeatureComponent].crosswalk.polygon.y"
 MAP_DRIVEWAY_POLYGON_X_COL = "[MapFeatureComponent].driveway.polygon.x"
 MAP_DRIVEWAY_POLYGON_Y_COL = "[MapFeatureComponent].driveway.polygon.y"
 MAP_SPEED_BUMP_POLYGON_X_COL = "[MapFeatureComponent].speed_bump.polygon.x"
 MAP_SPEED_BUMP_POLYGON_Y_COL = "[MapFeatureComponent].speed_bump.polygon.y"
+MAP_FEATURE_COLUMNS = (
+    MAP_FEATURE_ID_COL,
+    MAP_FEATURE_TYPE_COL,
+    MAP_LANE_POLYLINE_X_COL,
+    MAP_LANE_POLYLINE_Y_COL,
+    MAP_ROAD_EDGE_POLYLINE_X_COL,
+    MAP_ROAD_EDGE_POLYLINE_Y_COL,
+    MAP_ROAD_LINE_POLYLINE_X_COL,
+    MAP_ROAD_LINE_POLYLINE_Y_COL,
+    MAP_STOP_SIGN_POSITION_X_COL,
+    MAP_STOP_SIGN_POSITION_Y_COL,
+    MAP_STOP_SIGN_LANES_COL,
+    MAP_CROSSWALK_POLYGON_X_COL,
+    MAP_CROSSWALK_POLYGON_Y_COL,
+    MAP_DRIVEWAY_POLYGON_X_COL,
+    MAP_DRIVEWAY_POLYGON_Y_COL,
+    MAP_SPEED_BUMP_POLYGON_X_COL,
+    MAP_SPEED_BUMP_POLYGON_Y_COL,
+)
 
 class WaymoPerceptionDataset(Dataset):
     def __init__(
@@ -79,6 +99,8 @@ class WaymoPerceptionDataset(Dataset):
         self.wheelbase_m = float(wheelbase_m)
         self.max_steer_rad = float(max_steer_rad)
         self._ego_collision_poly = self.box_corners_2d(np.zeros(2, dtype=np.float64), 4.8, 2.0, 0.0)
+        self._map_index_cache = {}
+        self._map_feature_columns_cache = {}
 
         self.component_dirs = self.resolve_component_dirs(self.path)
         self.segment_paths = self.list_waymo_segments()
@@ -116,9 +138,12 @@ class WaymoPerceptionDataset(Dataset):
         # load lidar boxes
         boxes = self._load_lidar_boxes(segment_id, timestamps=timestamps)
         # load map index
-        # map_index = self._load_segment_map_index(segment_id, timestamps=timesteps)
-        # TODO: compute rewards based on map features and lidar boxes, currently set to zeros
-        reward_columns = np.zeros((len(timestamps), len(MAP_REWARD_KEYS)), dtype=np.float32)
+        map_feature = self._load_segment_map_index(segment_id)
+        reward_columns = self.calculate_reward(
+            map_feature=map_feature,
+            vehicle_poss=vehicle_poses,
+            lidar_boxes=boxes,
+        )
         is_first = np.zeros((len(timestamps), 1), dtype=bool)
         is_last = np.zeros((len(timestamps), 1), dtype=bool)
         is_terminal = np.zeros((len(timestamps), 1), dtype=bool)
@@ -373,41 +398,6 @@ class WaymoPerceptionDataset(Dataset):
             import pdb; pdb.set_trace()
             self._map_index_cache[data["segment_id"]] = data["map_index"]
 
-    def build_episode(self, frames, map_index):
-        # if not frames:
-        #     raise ValueError("Expected at least one frame to build an episode.")
-
-        # images = []
-        # actions = np.empty((len(frames), len(ACTION_KEYS)), dtype=np.float32)
-        # rewards = np.empty((len(frames), len(MAP_REWARD_KEYS)), dtype=np.float32)
-        # previous_frame = None
-        # previous_speed_mps = 0.0
-
-        # for idx, frame in enumerate(frames):
-        #     images.append(self.stack_front3_images(frame.front_images, image_size=self.image_size))
-        #     actions[idx], previous_speed_mps = self.derive_action(
-        #         previous_frame,
-        #         frame,
-        #         previous_speed_mps=previous_speed_mps,
-        #         wheelbase_m=self.wheelbase_m,
-        #         max_steer_rad=self.max_steer_rad,
-        #     )
-        #     rewards[idx] = self.compute_reward_row(frame, previous_frame, map_index)
-        #     previous_frame = frame
-
-        # episode = {
-        #     "image": np.stack(images, axis=0).astype(np.uint8),
-        #     "action": actions,
-        #     "reward": rewards,
-        #     "is_first": _flag(len(frames), first=True),
-        #     "is_last": _flag(len(frames), last=True),
-        #     "is_terminal": _flag(len(frames), last=True),
-        # }
-        # for reward_idx, key in enumerate(MAP_REWARD_KEYS):
-        #     episode[key] = rewards[:, reward_idx : reward_idx + 1].copy()
-        episode = {}
-        return episode
-
     def derive_action(self, vehicle_poses, timestamps):
         """Derive per-step actions from a sequence of ego vehicle poses.
         Returns a dense array with shape (T, 2) in ACTION_KEYS order:
@@ -449,6 +439,57 @@ class WaymoPerceptionDataset(Dataset):
             prev_speed_mps = speed_mps
         return actions
 
+    def calculate_reward(self, map_feature, vehicle_poss, lidar_boxes=None):
+        num_steps = len(vehicle_poss)
+        rewards = np.zeros((num_steps, len(MAP_REWARD_KEYS)), dtype=np.float32)
+        if num_steps == 0:
+            return rewards
+
+        if lidar_boxes is None:
+            lidar_boxes = [None] * num_steps
+
+        has_map_geometry = bool(map_feature.get("lanes")) or bool(map_feature.get("road_edges"))
+        previous_frame = None
+        for idx, pose_transform in enumerate(vehicle_poss):
+            box_rows = []
+            current_lidar_boxes = lidar_boxes[idx]
+            if current_lidar_boxes is None:
+                current_lidar_boxes = ()
+            for label in current_lidar_boxes:
+                if label is None or getattr(label, "box", None) is None:
+                    continue
+                box = label.box
+                box_rows.append(
+                    [
+                        float(box.center_x),
+                        float(box.center_y),
+                        float(box.length),
+                        float(box.width),
+                        float(box.heading),
+                    ]
+                )
+
+            frame = SimpleNamespace(
+                pose_transform=np.asarray(pose_transform, dtype=np.float64).reshape(4, 4),
+                lidar_boxes=np.asarray(box_rows, dtype=np.float64) if box_rows else np.zeros((0, 5), dtype=np.float64),
+            )
+
+            lane_info = None
+            leaves_road_boundary = False
+            if has_map_geometry:
+                lane_info, leaves_road_boundary, _, _ = self.calculate_map_metrics(
+                    frame,
+                    map_index=map_feature,
+                    previous_frame=previous_frame,
+                )
+
+            rewards[idx, 0] = 0.0 if lane_info is None else -(float(lane_info["alignment_angle"]) ** 2)
+            rewards[idx, 1] = 0.0 if lane_info is None else -(float(lane_info["distance_to_center"]) ** 2)
+            rewards[idx, 2] = -1.0 if self.detect_collision(frame) else 0.0
+            rewards[idx, 3] = -1.0 if leaves_road_boundary else 0.0
+            previous_frame = frame
+        return rewards
+
     def compute_reward_row(self, frame, previous_frame, map_index):
         lane_info, leaves_road_boundary, collision, cross_stop_line = self.calculate_map_metrics(
             frame,
@@ -488,7 +529,7 @@ class WaymoPerceptionDataset(Dataset):
         stop_signs = []
         for row_idx in np.argsort(feature_ids, kind="stable").tolist():
             feature_type = feature_types[row_idx]
-            feature_type = "" if feature_type is None else str(feature_type)
+            feature_type = "" if feature_type is None else str(feature_type).lower()
             feature_id = int(feature_ids[row_idx])
 
             if feature_type == "lane":
@@ -680,6 +721,33 @@ def _flag(time_dim, first=False, last=False):
     if last:
         value[-1, 0] = True
     return value
+
+def _is_missing(value):
+    if value is None:
+        return True
+    try:
+        return bool(np.isnan(value))
+    except (TypeError, ValueError):
+        return False
+
+def _to_list(value):
+    if value is None or _is_missing(value):
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return [value]
+
+def _polyline_from_lists(xs, ys):
+    points = []
+    for x, y in zip(_to_list(xs), _to_list(ys)):
+        if _is_missing(x) or _is_missing(y):
+            continue
+        points.append((float(x), float(y)))
+    if not points:
+        return np.zeros((0, 2), dtype=np.float64)
+    return np.asarray(points, dtype=np.float64)
 
 def _normalize_image_size(value):
     if value is None:
