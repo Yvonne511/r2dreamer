@@ -84,6 +84,11 @@ def rollout():
 			expert_actions = expert_actions.reshape(vecenv.action_space.shape)
 			obs, rewards, terminals, truncations, info = vecenv.step(expert_actions)
 			for env_id in range(driver_env.num_envs):
+				rc = driver_env.get_reward_components(env_id)
+				n = driver_env.agent_offsets[env_id + 1] - driver_env.agent_offsets[env_id]
+				assert all(v.shape == (n,) for v in rc.values()), \
+					f"step {step_idx} env {env_id}: unexpected shapes {({k: v.shape for k, v in rc.items()})}"
+			for env_id in range(driver_env.num_envs):
 				images, batch_indices = driver_env.render_all_controlled_agent_views(env_id=env_id)
 				scenario_id = scenario_ids[env_id].rstrip("\x00")
 				for local_agent_idx, (image, batch_idx) in enumerate(zip(images, batch_indices)):
