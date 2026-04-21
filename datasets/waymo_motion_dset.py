@@ -8,6 +8,14 @@ from torch.utils.data import Dataset
 from decord import VideoReader
 
 
+MAP_REWARD_KEYS = (
+    "reward_lane_alignment",
+    "reward_lane_center_offset",
+    "reward_collision",
+    "reward_road_boundary",
+)
+
+
 class WaymoMotionDataset(Dataset):
     def __init__(
         self,
@@ -83,7 +91,7 @@ class WaymoMotionDataset(Dataset):
             is_last[-1, 0] = True
             is_terminal[-1, 0] = True
 
-        return {
+        episode = {
             "image": images,
             "action": actions,
             "reward": rewards,
@@ -93,6 +101,12 @@ class WaymoMotionDataset(Dataset):
             "episode": np.full((len(step_ids),), episode_idx, dtype=np.int64),
             "step": step_ids,
         }
+        for reward_idx, key in enumerate(MAP_REWARD_KEYS):
+            component = np.zeros((len(step_ids), 1), dtype=np.float32)
+            if len(step_ids) > 1:
+                component[1:, 0] = raw_rewards[:-1, reward_idx]
+            episode[key] = component
+        return episode
 
 def _normalize_image_size(value):
     if value is None:
