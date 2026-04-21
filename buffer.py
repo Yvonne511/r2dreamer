@@ -1,6 +1,6 @@
 import torch
 from tensordict import TensorDict
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchrl.data.replay_buffers import LazyTensorStorage, ReplayBuffer
 from torchrl.data.replay_buffers.samplers import SliceSampler
 
@@ -77,15 +77,29 @@ class OfflineDatasetBuffer:
         num_workers = int(getattr(config.buffer, "num_workers", 4))
         pin_memory = bool(getattr(config.buffer, "pin_memory", self.device.type == "cuda"))
         persistent_workers = bool(getattr(config.buffer, "persistent_workers", num_workers > 0))
-        self.dataloader = DataLoader( # TODP: pass num_workers, pin_memory, etc. from config
-            dataset,
+
+        # Episode-level train/val split: last val_frac of episodes go to val.
+        val_frac = float(getattr(config.buffer, "val_frac", 0.1))
+        n_episodes = len(dataset.segment_paths)
+        n_val_eps = max(1, int(n_episodes * val_frac)) if val_frac > 0 else 0
+        val_ep_ids = set(range(n_episodes - n_val_eps, n_episodes))
+        train_indices = [i for i, (ep, _, _) in enumerate(dataset.slices) if ep not in val_ep_ids]
+        val_indices   = [i for i, (ep, _, _) in enumerate(dataset.slices) if ep in val_ep_ids]
+        self.has_val = len(val_indices) >= self.batch_size
+
+        dl_kwargs = dict(
             batch_size=self.batch_size,
-            shuffle=True,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers and num_workers > 0,
         )
+        self.dataloader = DataLoader(Subset(dataset, train_indices), shuffle=True, **dl_kwargs)
         self.iterator = iter(self.dataloader)
+        if self.has_val:
+            self.val_dataloader = DataLoader(
+                Subset(dataset, val_indices), shuffle=True, drop_last=True, **dl_kwargs
+            )
+            self.val_iterator = iter(self.val_dataloader)
         S, K = config.model.rssm.stoch, config.model.rssm.discrete
         D = config.model.rssm.deter
         self.stoch_cache = []
@@ -104,6 +118,36 @@ class OfflineDatasetBuffer:
             self.iterator = iter(self.dataloader)
             batch = next(self.iterator)
         return batch
+
+    def _next_val_batch(self):
+        try:
+            batch = next(self.val_iterator)
+        except StopIteration:
+            self.val_iterator = iter(self.val_dataloader)
+            batch = next(self.val_iterator)
+        return batch
+
+    def sample_val(self):
+        """Sample one batch from the held-out val split with zero initial latents."""
+        if not self.has_val:
+            raise RuntimeError("No validation split available (val_frac=0 or too few episodes).")
+        batch = self._next_val_batch()
+        B, Tp1 = batch["action"].shape[:2]
+        # Zero initial latents — val episodes are never written back to the cache.
+        S, K = self.stoch_cache[0].shape[1], self.stoch_cache[0].shape[2]
+        D = self.deter_cache[0].shape[1]
+        initial = (
+            torch.zeros(B, S, K, dtype=torch.float32, device=self.device),
+            torch.zeros(B, D, dtype=torch.float32, device=self.device),
+        )
+        td = TensorDict(
+            {k: torch.as_tensor(v, device=self.device) for k, v in batch.items()},
+            batch_size=[B, Tp1],
+            device=self.device,
+        )
+        data = td[:, 1:].clone()
+        data.set_("action", td["action"][:, :-1])
+        return data, initial
 
     def add_transition(self, data):
         raise NotImplementedError("Unused for dataset-backed offline buffer.")

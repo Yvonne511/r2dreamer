@@ -400,6 +400,63 @@ class Dreamer(nn.Module):
         replay_buffer.update(index, stoch.detach(), deter.detach())
         return metrics
 
+    @torch.no_grad()
+    def eval_loss(self, data, initial):
+        """Forward-only loss on a held-out val batch — no backward, no optimizer step."""
+        losses = {}
+        metrics = {}
+        B, T = data.shape
+
+        with autocast(device_type=self.device.type, dtype=torch.float16):
+            embed = self.encoder(data)
+            post_stoch, post_deter, post_logit = self.rssm.observe(
+                embed, data["action"], initial, data["is_first"]
+            )
+            _, prior_logit = self.rssm.prior(post_deter)
+            dyn_loss, rep_loss = self.rssm.kl_loss(post_logit, prior_logit, self.kl_free)
+            losses["dyn"] = torch.mean(dyn_loss)
+            losses["rep"] = torch.mean(rep_loss)
+
+            feat = self.rssm.get_feat(post_stoch, post_deter)
+
+            if self.rep_loss == "dreamer":
+                recon_losses = {
+                    key: torch.mean(-dist.log_prob(data[key]))
+                    for key, dist in self.decoder(post_stoch, post_deter).items()
+                }
+                losses.update(recon_losses)
+            elif self.rep_loss == "r2dreamer":
+                losses["barlow"] = self._barlow_loss(feat, embed)
+            elif self.rep_loss == "infonce":
+                x1 = self.prj(feat.reshape(B * T, -1))
+                x2 = embed.reshape(B * T, -1)
+                logits = torch.matmul(x1, x2.T)
+                norm_logits = logits - torch.max(logits, 1)[0][:, None]
+                labels = torch.arange(norm_logits.shape[0]).long().to(self.device)
+                losses["infonce"] = F.cross_entropy(norm_logits, labels)
+            elif self.rep_loss == "policy_supervised":
+                losses["bc"] = torch.mean(-self.bc(feat).log_prob(to_f32(data["action"])))
+            # dreamerpro: skip prototype/augmentation losses in eval
+
+            if self.reward_verifier is not None:
+                reward_losses = []
+                for key, dist in self.reward_verifier(embed.detach()).items():
+                    target = to_f32(data[key])
+                    if key in self.binary_reward_target_keys:
+                        target = to_f32(target != 0)
+                    reward_loss = torch.mean(-dist.log_prob(target))
+                    reward_losses.append(reward_loss)
+                    metrics[f"loss/recon_reward_{key}"] = reward_loss
+                losses["recon_reward"] = torch.stack(reward_losses).mean()
+
+            total_loss = sum(v * self._loss_scales.get(k, 1.0) for k, v in losses.items())
+
+        metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
+        metrics["opt/loss"] = total_loss
+        metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
+        metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
+        return metrics
+
     def _cal_grad(self, data, initial):
         """Compute gradients for one batch.
 

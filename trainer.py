@@ -231,3 +231,18 @@ class OnlineTrainer:
                     for name, param in agent._named_params.items():
                         self.logger.histogram(name, tools.to_np(param))
                 self.logger.write(step, fps=True)
+
+            if self._should_eval(step) and self.replay_buffer.has_val:
+                agent.eval()
+                val_data, val_initial = self.replay_buffer.sample_val()
+                p_val_data = agent.preprocess(val_data)
+                val_metrics = agent.eval_loss(p_val_data, val_initial)
+                for name, value in val_metrics.items():
+                    value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
+                    self.logger.scalar(f"val/{name}", value)
+                if self.video_pred_log and agent.rep_loss == "dreamer":
+                    self.logger.video(
+                        "val_open_loop", tools.to_np(agent.video_pred(val_data, val_initial))
+                    )
+                self.logger.write(step)
+                agent.train()
