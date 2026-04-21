@@ -17,14 +17,14 @@ from tqdm.auto import tqdm
 PUFFER_ROOT = Path("/scratch/yw4142/PufferDrive")
 MAP_DIR = Path("/scratch/yw4142/datasets/ad/WOMD/resources/drive/binaries/training")
 PUFFER_CONFIG_YAML = Path("/home/yw4142/ad/r2dreamer/configs/env/puffer_drive.yaml")
-OUTPUT_ROOT = Path("/scratch/yw4142/datasets/ad/waymo_pufferdrive")
+OUTPUT_ROOT = Path("/scratch/yw4142/datasets/ad/waymo_pufferdrive_256")
 
 SCENES_PER_BATCH = 64
 SEED = 0
 START_MAP_ID = 0
 END_MAP_ID = None
-MAX_MAPS = None
-OVERWRITE = False
+MAX_MAPS = None  # set to None for full dataset
+OVERWRITE = True
 FPS = 10
 
 
@@ -75,7 +75,7 @@ def prepare_output_dirs(output_root: Path) -> Path:
             raise FileExistsError(f"{output_root} already exists. Set OVERWRITE = True to replace it.")
         shutil.rmtree(output_root)
     obses_dir = output_root / "obses"
-    obses_dir.mkdir(parents=True, exist_ok=False)
+    obses_dir.mkdir(parents=True, exist_ok=True)
     return obses_dir
 
 
@@ -164,7 +164,7 @@ def export_chunk(
     batch_size = len(fixed_map_ids)
     t_max = int(cfg["env"]["episode_length"]) - 1
     actions = np.zeros((batch_size, t_max, 3), dtype=np.float32)
-    rewards = np.zeros((batch_size, t_max), dtype=np.float32)
+    rewards = np.zeros((batch_size, t_max, 4), dtype=np.float32)
     states = np.zeros((batch_size, t_max, 7), dtype=np.float32)
     seq_lengths = np.zeros(batch_size, dtype=np.int64)
     scenario_ids_by_agent = [""] * batch_size
@@ -213,8 +213,11 @@ def export_chunk(
                 writer = get_video_writer(video_writers, trajectory_index, output_path, image.shape)
                 writer.write(cv2.cvtColor(image, cv2.COLOR_RGBA2BGR))
 
-            _, step_rewards, _, _, _ = driver_env.step(expert_actions)
-            step_rewards = np.asarray(step_rewards, dtype=np.float32)
+            driver_env.step(expert_actions)
+            rc = driver_env.get_reward_components()
+            step_rewards = np.stack(
+                [rc["alignment_angle"], rc["distance_to_center"], rc["collision"], rc["offroad"]], axis=-1
+            )
 
             states[valid_mask, step_idx] = state_snapshot[valid_mask]
             actions[valid_mask, step_idx] = expert_actions[valid_mask]
@@ -273,6 +276,13 @@ def export_dataset():
     rewards_tensor = torch.from_numpy(np.concatenate(all_rewards, axis=0))
     states_tensor = torch.from_numpy(np.concatenate(all_states, axis=0))
     seq_lengths_tensor = torch.from_numpy(np.concatenate(all_seq_lengths, axis=0))
+
+    N, T = len(all_scenario_ids), actions_tensor.shape[1]
+    assert actions_tensor.shape == (N, T, 3), f"actions {actions_tensor.shape} != ({N}, {T}, 3)"
+    assert rewards_tensor.shape == (N, T, 4), f"rewards {rewards_tensor.shape} != ({N}, {T}, 4)"
+    assert states_tensor.shape == (N, T, 7), f"states {states_tensor.shape} != ({N}, {T}, 7)"
+    assert seq_lengths_tensor.shape == (N,), f"seq_lengths {seq_lengths_tensor.shape} != ({N},)"
+    assert len(list((OUTPUT_ROOT / "obses").glob("*.mp4"))) == N, f"expected {N} videos in obses/"
 
     torch.save(actions_tensor, OUTPUT_ROOT / "actions.pth")
     torch.save(rewards_tensor, OUTPUT_ROOT / "rewards.pth")

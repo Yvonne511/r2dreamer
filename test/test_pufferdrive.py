@@ -16,6 +16,7 @@ steps = 300
 
 sys.path.insert(0, str(puffer_root))
 from pufferlib.pufferl import load_env
+from pufferlib.ocean.drive.drive import RenderView
 
 
 def get_video_writer(
@@ -89,14 +90,15 @@ def rollout():
 				assert all(v.shape == (n,) for v in rc.values()), \
 					f"step {step_idx} env {env_id}: unexpected shapes {({k: v.shape for k, v in rc.items()})}"
 			for env_id in range(driver_env.num_envs):
-				images, batch_indices = driver_env.render_all_controlled_agent_views(env_id=env_id)
 				scenario_id = scenario_ids[env_id].rstrip("\x00")
-				for local_agent_idx, (image, batch_idx) in enumerate(zip(images, batch_indices)):
-					output_path = render_output_dir / (
-						f"{scenario_id}_env_{env_id:03d}_agent_{local_agent_idx:03d}_batch_{int(batch_idx):05d}.mp4"
-					)
-					writer = get_video_writer(video_writers, output_path, image.shape)
-					writer.write(cv2.cvtColor(image[..., :3], cv2.COLOR_RGB2BGR))
+				for view_mode, suffix in [(RenderView.AGENT_PERSP, ""), (RenderView.BEV_AGENT_OBS, "_bev")]:
+					images, batch_indices = driver_env.render_all_controlled_agent_views(env_id=env_id, view_mode=view_mode)
+					for local_agent_idx, (image, batch_idx) in enumerate(zip(images, batch_indices)):
+						output_path = render_output_dir / (
+							f"{scenario_id}_env_{env_id:03d}_agent_{local_agent_idx:03d}_batch_{int(batch_idx):05d}{suffix}.mp4"
+						)
+						writer = get_video_writer(video_writers, output_path, image.shape)
+						writer.write(cv2.cvtColor(image[..., :3], cv2.COLOR_RGB2BGR))
 			
 			reward_sums.append(float(np.asarray(rewards).sum()))
 	finally:
