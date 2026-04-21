@@ -17,7 +17,7 @@ from tqdm.auto import tqdm
 PUFFER_ROOT = Path("/scratch/yw4142/PufferDrive")
 MAP_DIR = Path("/scratch/yw4142/datasets/ad/WOMD/resources/drive/binaries/training")
 PUFFER_CONFIG_YAML = Path("/home/yw4142/ad/r2dreamer/configs/env/puffer_drive.yaml")
-OUTPUT_ROOT = Path("/scratch/yw4142/datasets/ad/waymo_pufferdrive_256")
+OUTPUT_ROOT = Path("/scratch/yw4142/datasets/ad/waymo_pufferdrive_256_wBEV")
 
 SCENES_PER_BATCH = 64
 SEED = 0
@@ -69,14 +69,16 @@ def iter_chunks(items: list[int], chunk_size: int):
         yield start, items[start : start + chunk_size]
 
 
-def prepare_output_dirs(output_root: Path) -> Path:
+def prepare_output_dirs(output_root: Path) -> tuple[Path, Path]:
     if output_root.exists():
         if not OVERWRITE:
             raise FileExistsError(f"{output_root} already exists. Set OVERWRITE = True to replace it.")
         shutil.rmtree(output_root)
     obses_dir = output_root / "obses"
+    bev_obses_dir = output_root / "bev_obses"
     obses_dir.mkdir(parents=True, exist_ok=True)
-    return obses_dir
+    bev_obses_dir.mkdir(parents=True, exist_ok=True)
+    return obses_dir, bev_obses_dir
 
 
 def get_video_writer(
@@ -89,6 +91,7 @@ def get_video_writer(
     if writer is not None:
         return writer
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     height, width, _ = frame_shape
     writer = cv2.VideoWriter(
         str(output_path),
@@ -157,6 +160,7 @@ def export_chunk(
     fixed_map_ids: list[int],
     global_start_index: int,
     obses_dir: Path,
+    bev_obses_dir: Path,
     available_map_count: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, list[str]]:
     driver_env, cfg = load_pufferdrive_env(fixed_map_ids=fixed_map_ids, available_map_count=available_map_count)
@@ -170,6 +174,7 @@ def export_chunk(
     scenario_ids_by_agent = [""] * batch_size
     seen_invalid = np.zeros(batch_size, dtype=bool)
     video_writers: dict[int, cv2.VideoWriter] = {}
+    bev_video_writers: dict[int, cv2.VideoWriter] = {}
 
     if driver_env.num_envs != batch_size:
         raise RuntimeError(
@@ -213,6 +218,18 @@ def export_chunk(
                 writer = get_video_writer(video_writers, trajectory_index, output_path, image.shape)
                 writer.write(cv2.cvtColor(image, cv2.COLOR_RGBA2BGR))
 
+                bev_image = driver_env.render(
+                    view_mode=RenderView.BEV_AGENT_OBS,
+                    draw_traces=True,
+                    env_id=env_id,
+                    agent_idx=0,
+                    return_rgb=True,
+                )
+
+                bev_output_path = bev_obses_dir / f"{trajectory_index}.mp4"
+                bev_writer = get_video_writer(bev_video_writers, trajectory_index, bev_output_path, bev_image.shape)
+                bev_writer.write(cv2.cvtColor(bev_image, cv2.COLOR_RGBA2BGR))
+
             driver_env.step(expert_actions)
             rc = driver_env.get_reward_components()
             step_rewards = np.stack(
@@ -226,6 +243,8 @@ def export_chunk(
             seen_invalid |= ~valid_mask
     finally:
         for writer in video_writers.values():
+            writer.release()
+        for writer in bev_video_writers.values():
             writer.release()
         # Repeated render + explicit close currently triggers a native double-free in this path.
 
@@ -242,7 +261,7 @@ def export_dataset():
     available_map_ids = discover_available_map_ids(MAP_DIR)
     selected_map_ids = get_selected_map_ids(available_map_ids)
     available_map_count = len(available_map_ids)
-    obses_dir = prepare_output_dirs(OUTPUT_ROOT)
+    obses_dir, bev_obses_dir = prepare_output_dirs(OUTPUT_ROOT)
 
     all_actions = []
     all_rewards = []
@@ -264,6 +283,7 @@ def export_dataset():
             fixed_map_ids=map_id_chunk,
             global_start_index=global_start_index,
             obses_dir=obses_dir,
+            bev_obses_dir=bev_obses_dir,
             available_map_count=available_map_count,
         )
         all_actions.append(chunk_actions)
@@ -283,6 +303,7 @@ def export_dataset():
     assert states_tensor.shape == (N, T, 7), f"states {states_tensor.shape} != ({N}, {T}, 7)"
     assert seq_lengths_tensor.shape == (N,), f"seq_lengths {seq_lengths_tensor.shape} != ({N},)"
     assert len(list((OUTPUT_ROOT / "obses").glob("*.mp4"))) == N, f"expected {N} videos in obses/"
+    assert len(list((OUTPUT_ROOT / "bev_obses").glob("*.mp4"))) == N, f"expected {N} videos in bev_obses/"
 
     torch.save(actions_tensor, OUTPUT_ROOT / "actions.pth")
     torch.save(rewards_tensor, OUTPUT_ROOT / "rewards.pth")
