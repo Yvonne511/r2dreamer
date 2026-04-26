@@ -36,6 +36,8 @@ class Dreamer(nn.Module):
         self.encoder = networks.MultiEncoder(config.encoder, shapes)
         self.embed_size = self.encoder.out_dim
         self.reconstruct_reward = bool(config.reconstruct_reward)
+        self.reconstruct_img = bool(config.reconstruct_img)
+        self.reconstruct_bev = bool(config.reconstruct_bev)
         self.reward_target_keys = tuple(sorted(key for key in shapes if key.startswith("reward_")))
         self.binary_reward_target_keys = frozenset({"reward_collision", "reward_road_boundary"})
         if self.reconstruct_reward and self.reward_target_keys:
@@ -96,6 +98,27 @@ class Dreamer(nn.Module):
         }
         if self.reward_verifier is not None:
             modules["reward_verifier"] = self.reward_verifier
+
+        _decoder_type = str(getattr(config.decoder.cnn, "type", "default"))
+        _decoder_cls = networks.DenseConvDecoder if _decoder_type == "dense" else networks.ConvDecoder
+
+        if self.reconstruct_img and "image" in shapes:
+            _img_cnn_shape = (shapes["image"][-1],) + shapes["image"][:-1]
+            self.img_decoder = _decoder_cls(
+                config.decoder.cnn, self.rssm._deter, self.rssm.flat_stoch, _img_cnn_shape
+            )
+            modules["img_decoder"] = self.img_decoder
+        else:
+            self.img_decoder = None
+
+        if self.reconstruct_bev and "bev_image" in shapes:
+            _bev_cnn_shape = (shapes["bev_image"][-1],) + shapes["bev_image"][:-1]
+            self.bev_decoder = _decoder_cls(
+                config.decoder.cnn, self.rssm._deter, self.rssm.flat_stoch, _bev_cnn_shape
+            )
+            modules["bev_decoder"] = self.bev_decoder
+        else:
+            self.bev_decoder = None
 
         if self.rep_loss == "dreamer":
             self.decoder = networks.MultiDecoder(
@@ -333,9 +356,16 @@ class Dreamer(nn.Module):
         return self._video_pred(p_data, initial)
 
     def _video_pred(self, data, initial):
-        """Video prediction utility."""
-        if self.rep_loss != "dreamer":
-            raise NotImplementedError("video_pred requires decoder and is only supported when rep_loss == 'dreamer'.")
+        """Video prediction utility. Returns a dict of name -> (B, T, H*3, W, C) video tensors."""
+        has_img = self.img_decoder is not None and "image" in data
+        has_bev = self.bev_decoder is not None and "bev_image" in data
+        # fall back to MultiDecoder image only when img_decoder isn't separately available
+        has_dreamer = self.rep_loss == "dreamer" and not has_img
+
+        if not (has_img or has_bev or has_dreamer):
+            raise NotImplementedError(
+                "video_pred requires img_decoder, bev_decoder, or rep_loss='dreamer'."
+            )
 
         B = min(data["action"].shape[0], 6)
         # (B, T, E)
@@ -347,18 +377,38 @@ class Dreamer(nn.Module):
             tuple(val[:B] for val in initial),
             data["is_first"][:B, :5],
         )
-        recon = self.decoder(post_stoch, post_deter)["image"].mode()[:B]
         init_stoch, init_deter = post_stoch[:, -1], post_deter[:, -1]
         prior_stoch, prior_deter = self.rssm.imagine_with_action(
-            init_stoch,
-            init_deter,
-            data["action"][:B, 5:],
+            init_stoch, init_deter, data["action"][:B, 5:]
         )
-        openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
-        model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:B]
-        error = (model - truth + 1.0) / 2.0
-        return torch.cat([truth, model, error], 2)
+
+        videos = {}
+
+        if has_dreamer:
+            recon = self.decoder(post_stoch, post_deter)["image"].mode()
+            openl = self.decoder(prior_stoch, prior_deter)["image"].mode()
+            model = torch.cat([recon, openl], 1)
+            truth = data["image"][:B]
+            error = (model - truth + 1.0) / 2.0
+            videos["image"] = torch.cat([truth, model, error], 2)
+
+        if has_img:
+            recon = self.img_decoder(post_stoch, post_deter)
+            openl = self.img_decoder(prior_stoch, prior_deter)
+            model = torch.cat([recon, openl], 1)
+            truth = data["image"][:B]
+            error = (model - truth + 1.0) / 2.0
+            videos["image_recon"] = torch.cat([truth, model, error], 2)
+
+        if has_bev:
+            recon = self.bev_decoder(post_stoch, post_deter)
+            openl = self.bev_decoder(prior_stoch, prior_deter)
+            model = torch.cat([recon, openl], 1)
+            truth = data["bev_image"][:B]
+            error = (model - truth + 1.0) / 2.0
+            videos["bev_recon"] = torch.cat([truth, model, error], 2)
+
+        return videos
 
     def update(self, replay_buffer):
         """Sample a batch from replay and perform one optimization step."""
@@ -448,6 +498,13 @@ class Dreamer(nn.Module):
                     reward_losses.append(reward_loss)
                     metrics[f"loss/recon_reward_{key}"] = reward_loss
                 losses["recon_reward"] = torch.stack(reward_losses).mean()
+
+            if self.img_decoder is not None and "image" in data:
+                img_out = self.img_decoder(post_stoch.detach(), post_deter.detach())
+                losses["recon_img"] = F.mse_loss(img_out, to_f32(data["image"]))
+            if self.bev_decoder is not None and "bev_image" in data:
+                bev_out = self.bev_decoder(post_stoch.detach(), post_deter.detach())
+                losses["recon_bev"] = F.mse_loss(bev_out, to_f32(data["bev_image"]))
 
             total_loss = sum(v * self._loss_scales.get(k, 1.0) for k, v in losses.items())
 
@@ -539,6 +596,15 @@ class Dreamer(nn.Module):
                 reward_losses.append(reward_loss)
                 metrics[f"loss/recon_reward_{key}"] = reward_loss
             losses["recon_reward"] = torch.stack(reward_losses).mean()
+
+        # Auxiliary image decoders — detached latents so encoder is not supervised
+        if self.img_decoder is not None and "image" in data:
+            img_out = self.img_decoder(post_stoch.detach(), post_deter.detach())
+            losses["recon_img"] = F.mse_loss(img_out, to_f32(data["image"]))
+        if self.bev_decoder is not None and "bev_image" in data:
+            bev_out = self.bev_decoder(post_stoch.detach(), post_deter.detach())
+            losses["recon_bev"] = F.mse_loss(bev_out, to_f32(data["bev_image"]))
+
         # log
         metrics["dyn_entropy"] = torch.mean(self.rssm.get_dist(prior_logit).entropy())
         metrics["rep_entropy"] = torch.mean(self.rssm.get_dist(post_logit).entropy())
@@ -634,7 +700,7 @@ class Dreamer(nn.Module):
             metrics.update(tools.tensorstats(value, "value_replay"))
             metrics.update(tools.tensorstats(slow_value, "slow_value_replay"))
 
-        total_loss = sum([v * self._loss_scales[k] for k, v in losses.items()])
+        total_loss = sum([v * self._loss_scales.get(k, 1.0) for k, v in losses.items()])
         self._scaler.scale(total_loss).backward()
 
         metrics.update({f"loss/{name}": loss for name, loss in losses.items()})
@@ -681,6 +747,8 @@ class Dreamer(nn.Module):
     def preprocess(self, data):
         if "image" in data:
             data["image"] = to_f32(data["image"]) / 255.0
+        if "bev_image" in data:
+            data["bev_image"] = to_f32(data["bev_image"]) / 255.0
         return data
 
     @torch.no_grad()

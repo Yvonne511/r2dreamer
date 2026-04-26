@@ -52,6 +52,9 @@ class WaymoMotionDataset(Dataset):
             raise ValueError("Waymo motion dataset files have inconsistent rollout counts.")
 
         self.video_paths = [self.obs_dir / f"{idx}.mp4" for idx in range(num_rollouts)]
+        self.bev_video_paths = None
+        if (self.path / "bev_obses").is_dir():
+            self.bev_video_paths = [self.path / "bev_obses" / f"{idx}.mp4" for idx in range(num_rollouts)]
         missing = [str(path) for path in self.video_paths if not path.is_file()]
         if missing:
             raise FileNotFoundError(f"Missing rollout videos: {missing[:4]}")
@@ -75,12 +78,16 @@ class WaymoMotionDataset(Dataset):
 
         reader = VideoReader(str(self.video_paths[episode_idx]), num_threads=1)
         images = reader.get_batch(step_ids).asnumpy()
-        actions = self.actions[episode_idx, start:end:self.frame_skip].copy()
+
+        if self.bev_video_paths is not None:
+            bev_reader = VideoReader(str(self.bev_video_paths[episode_idx]), num_threads=1)
+            bev_images = bev_reader.get_batch(step_ids).asnumpy()
+        actions = self.actions[episode_idx, start:end].reshape(-1, self.frame_skip * self.actions.shape[-1])
 
         raw_rewards = self.rewards[episode_idx, start:end:self.frame_skip]
         rewards = np.zeros((len(step_ids), 1), dtype=np.float32)
         if len(step_ids) > 1:
-            rewards[1:, 0] = raw_rewards[:-1]
+            rewards[1:, 0] = -(raw_rewards[:-1, 2] + raw_rewards[:-1, 3])
 
         is_first = np.zeros((len(step_ids), 1), dtype=bool)
         is_last = np.zeros((len(step_ids), 1), dtype=bool)
@@ -93,6 +100,7 @@ class WaymoMotionDataset(Dataset):
 
         episode = {
             "image": images,
+            **({"bev_image": bev_images} if self.bev_video_paths is not None else {}),
             "action": actions,
             "reward": rewards,
             "is_first": is_first,

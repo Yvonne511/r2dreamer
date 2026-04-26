@@ -2,11 +2,12 @@ defaults:
   - env: dmc_vision
   - model: size12M
   # Disable Hydra's Python logging-to-file (train.log)
-  - override hydra/job_logging: disabled
+  # - override hydra/job_logging: disabled
   - _self_
+  - override hydra/launcher: submitit_slurm
 
 ckpt_base_path: /scratch/yw4142/checkpoints/ad/LatentDrive
-logdir: ${ckpt_base_path}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+logdir: ${ckpt_base_path}/${now:%Y-%m-%d}_${now:%H-%M-%S}
 seed: 0
 deterministic_run: False
 device: 'cuda:0'
@@ -15,26 +16,44 @@ offline: False
 hydra:
   run:
     dir: ${logdir}
+  sweep:
+    dir: ${logdir}
+    subdir: ${hydra.job.num}
+  launcher:
+    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
+    account: torch_pr_37_lpinto
+    nodes: 1
+    tasks_per_node: 1
+    cpus_per_task: 8
+    mem_gb: 128
+    gres: "gpu:1"
+    # qos: "explore"
+    timeout_min: 4320 #10080
+    # timeout_min: 180
+    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
+            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
+            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
 
-batch_size: 2
+batch_size: 16
 batch_length: 24
 
 buffer:
   batch_size: ${batch_size}
   batch_length: ${batch_length}
-  max_size: 5e5
+  max_size: 1e5
   device: ${device}
   storage_device: 'cuda:0'
+  val_frac: 0.1
 
 trainer:
   steps: ${env.steps}
   pretrain: 0
-  eval_every: 1e4
+  eval_every: 5e4
   eval_episode_num: ${env.eval_episode_num}
   batch_size: ${batch_size}
   batch_length: ${batch_length}
   train_ratio: ${env.train_ratio}
-  video_pred_log: False
+  video_pred_log: True
   params_hist_log: False
-  update_log_every: 5e3
+  update_log_every: 5e4
   action_repeat: ${env.action_repeat}

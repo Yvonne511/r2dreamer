@@ -1,0 +1,26 @@
+defaults:
+  - _base_
+
+# Full-resolution Waymo smoke-test preset.
+# The input stays at 1280x5760, but the CNN downsamples more aggressively so
+# the flattened embedding stays tractable for the projector and auxiliary heads.
+rep_loss: 'policy_supervised'
+compile: False
+deter: 1024
+hidden: 256
+discrete: 16
+depth: 8
+units: 256
+act: 'SiLU'
+norm: True
+
+encoder:
+  cnn:
+    depth: 8
+    mults: [2, 2, 2, 4, 4]
+    strides: [4, 1, 1, 1, 1]
+
+decoder:
+  cnn:
+    depth: 8
+    mults: [2, 2, 2, 4, 4]

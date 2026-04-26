@@ -90,15 +90,8 @@ class OnlineTrainer:
             self.logger.video("eval_video", tools.to_np(cache["image"][:1]))
         if self.video_pred_log and cache is not None:
             initial = agent.get_initial_state(1)
-            self.logger.video(
-                "eval_open_loop",
-                tools.to_np(
-                    agent.video_pred(
-                        cache[:1],  # give only first batch
-                        (initial["stoch"], initial["deter"]),
-                    )
-                ),
-            )
+            for name, vid in agent.video_pred(cache[:1], (initial["stoch"], initial["deter"])).items():
+                self.logger.video(f"eval_open_loop_{name}", tools.to_np(vid))
         self.logger.write(train_step)
         agent.train()
 
@@ -194,7 +187,8 @@ class OnlineTrainer:
                     self.logger.scalar("train/opt/updates", update_count)
                     if self.video_pred_log:
                         data, _, initial = self.replay_buffer.sample()
-                        self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                        for name, vid in agent.video_pred(data, initial).items():
+                            self.logger.video(f"open_loop_{name}", tools.to_np(vid))
                     if self.params_hist_log:
                         for name, param in agent._named_params.items():
                             self.logger.histogram(name, tools.to_np(param))
@@ -226,7 +220,8 @@ class OnlineTrainer:
                 self.logger.scalar("train/opt/updates", update_count)
                 if self.video_pred_log:
                     data, _, initial = self.replay_buffer.sample()
-                    self.logger.video("open_loop", tools.to_np(agent.video_pred(data, initial)))
+                    for name, vid in agent.video_pred(data, initial).items():
+                        self.logger.video(f"open_loop_{name}", tools.to_np(vid))
                 if self.params_hist_log:
                     for name, param in agent._named_params.items():
                         self.logger.histogram(name, tools.to_np(param))
@@ -235,14 +230,13 @@ class OnlineTrainer:
             if self._should_eval(step) and self.replay_buffer.has_val:
                 agent.eval()
                 val_data, val_initial = self.replay_buffer.sample_val()
-                p_val_data = agent.preprocess(val_data)
-                val_metrics = agent.eval_loss(p_val_data, val_initial)
+                if self.video_pred_log:
+                    for name, vid in agent.video_pred(val_data, val_initial).items():
+                        self.logger.video(f"val_open_loop_{name}", tools.to_np(vid))
+                agent.preprocess(val_data) # preprocess modify val_data in-place for eval_loss
+                val_metrics = agent.eval_loss(val_data, val_initial)
                 for name, value in val_metrics.items():
                     value = tools.to_np(value) if isinstance(value, torch.Tensor) else value
                     self.logger.scalar(f"val/{name}", value)
-                if self.video_pred_log and agent.rep_loss == "dreamer":
-                    self.logger.video(
-                        "val_open_loop", tools.to_np(agent.video_pred(val_data, val_initial))
-                    )
                 self.logger.write(step)
                 agent.train()

@@ -1,0 +1,28 @@
+defaults:
+  - _base_
+
+# 256x256 BEV input (PufferDrive / Waymo Motion).
+# 5 conv+pool layers: 256→128→64→32→16→8 (encoder), 8→…→256 (decoder).
+# Stops at 8x8 (32px/cell) so individual vehicles and lane geometry stay
+# spatially separable. Encoder out_dim = (8*4) * 8 * 8 = 2048.
+rep_loss: 'policy_supervised'
+compile: False
+deter: 1024
+hidden: 256
+discrete: 16
+depth: 8
+units: 256
+act: 'SiLU'
+norm: True
+
+encoder:
+  cnn:
+    type: dense
+    depth: 8
+    mults: [2, 3, 4, 4, 4]
+
+decoder:
+  cnn:
+    type: dense
+    depth: 8
+    mults: [2, 3, 4, 4, 4]

@@ -80,24 +80,23 @@ class OfflineDatasetBuffer:
 
         # Episode-level train/val split: last val_frac of episodes go to val.
         val_frac = float(getattr(config.buffer, "val_frac", 0.1))
-        n_episodes = len(dataset.segment_paths)
-        n_val_eps = max(1, int(n_episodes * val_frac)) if val_frac > 0 else 0
-        val_ep_ids = set(range(n_episodes - n_val_eps, n_episodes))
+        n_slices = len(dataset)
+        n_val_eps = max(1, int(n_slices * val_frac)) if val_frac > 0 else 0
+        val_ep_ids = set(range(n_slices - n_val_eps, n_slices))
         train_indices = [i for i, (ep, _, _) in enumerate(dataset.slices) if ep not in val_ep_ids]
         val_indices   = [i for i, (ep, _, _) in enumerate(dataset.slices) if ep in val_ep_ids]
-        self.has_val = len(val_indices) >= self.batch_size
+        self.has_val = len(val_indices) >= 2
 
         dl_kwargs = dict(
-            batch_size=self.batch_size,
             num_workers=num_workers,
             pin_memory=pin_memory,
             persistent_workers=persistent_workers and num_workers > 0,
         )
-        self.dataloader = DataLoader(Subset(dataset, train_indices), shuffle=True, **dl_kwargs)
+        self.dataloader = DataLoader(Subset(dataset, train_indices), shuffle=True, drop_last=True, batch_size=self.batch_size, **dl_kwargs)
         self.iterator = iter(self.dataloader)
         if self.has_val:
             self.val_dataloader = DataLoader(
-                Subset(dataset, val_indices), shuffle=True, drop_last=True, **dl_kwargs
+                Subset(dataset, val_indices), shuffle=True, drop_last=True, batch_size=2, **dl_kwargs
             )
             self.val_iterator = iter(self.val_dataloader)
         S, K = config.model.rssm.stoch, config.model.rssm.discrete

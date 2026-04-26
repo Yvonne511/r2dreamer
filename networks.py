@@ -119,7 +119,11 @@ class MultiEncoder(nn.Module):
         if self.cnn_shapes:
             input_ch = sum([v[-1] for v in self.cnn_shapes.values()])
             input_shape = tuple(self.cnn_shapes.values())[0][:2] + (input_ch,)
-            self.encoders.append(ConvEncoder(config.cnn, input_shape))
+            cnn_type = str(getattr(config.cnn, "type", "default"))
+            if cnn_type == "dense":
+                self.encoders.append(DenseConvEncoder(config.cnn, input_shape))
+            else:
+                self.encoders.append(ConvEncoder(config.cnn, input_shape))
             self.selectors.append(lambda obs: torch.cat([obs[k] for k in self.cnn_shapes], -1))
             self.out_dim += self.encoders[-1].out_dim
         if self.mlp_shapes:
@@ -159,7 +163,9 @@ class MultiDecoder(nn.Module):
         if self.cnn_shapes:
             some_shape = list(self.cnn_shapes.values())[0]
             shape = (sum(x[-1] for x in self.cnn_shapes.values()),) + some_shape[:-1]
-            self._cnn = ConvDecoder(
+            cnn_type = str(getattr(config.cnn, "type", "default"))
+            decoder_cls = DenseConvDecoder if cnn_type == "dense" else ConvDecoder
+            self._cnn = decoder_cls(
                 config.cnn,
                 deter,
                 flat_stoch,
@@ -266,6 +272,40 @@ class ConvEncoder(nn.Module):
         return x.reshape(*obs.shape[:-3], x.shape[-1])
 
 
+class DenseConvEncoder(nn.Module):
+    """Encoder for images with fine spatial features (e.g., 1-3px lane lines).
+
+    Uses stride-2 convolutions with small kernels instead of large-kernel conv + MaxPool,
+    preserving thin features better. Output dimension matches ConvEncoder with same config.
+    """
+    def __init__(self, config, input_shape):
+        super().__init__()
+        act = getattr(torch.nn, config.act)
+        h, w, input_ch = input_shape
+        self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
+        in_dim = input_ch
+        layers = []
+        for depth in self.depths:
+            layers.append(Conv2dSamePad(in_dim, depth, kernel_size=3, stride=2, bias=True))
+            if config.norm:
+                layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
+            layers.append(act())
+            in_dim = depth
+            h = (h + 1) // 2
+            w = (w + 1) // 2
+
+        self.out_dim = self.depths[-1] * h * w
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, obs):
+        obs = obs - 0.5
+        x = obs.reshape(-1, *obs.shape[-3:])
+        x = x.permute(0, 3, 1, 2)
+        x = self.layers(x)
+        x = x.reshape(x.shape[0], -1)
+        return x.reshape(*obs.shape[:-3], x.shape[-1])
+
+
 class ConvDecoder(nn.Module):
     def __init__(self, config, deter, flat_stoch, shape=(3, 64, 64)):
         super().__init__()
@@ -339,6 +379,57 @@ class ConvDecoder(nn.Module):
         x = x.permute(0, 2, 3, 1)
         x = torch.sigmoid(x)
         # (B, T, H, W, C)
+        return x.reshape(*B_T, *x.shape[1:])
+
+
+class DenseConvDecoder(nn.Module):
+    """Decoder for reconstructing images with fine spatial features.
+
+    Uses transposed convolutions (k=4, s=2) for more precise upsampling.
+    Mirrors DenseConvEncoder architecture.
+    """
+    def __init__(self, config, deter, flat_stoch, shape=(3, 64, 64)):
+        super().__init__()
+        act = getattr(torch.nn, config.act)
+        self._shape = shape
+        self.depths = tuple(int(config.depth) * int(mult) for mult in list(config.mults))
+        factor = 2 ** len(self.depths)
+        minres = [int(x // factor) for x in shape[1:]]
+        self.min_shape = (*minres, self.depths[-1])
+        self.bspace = int(config.bspace)
+        self.units = int(config.units)
+        u, g = math.prod(self.min_shape), self.bspace
+        self.sp0 = BlockLinear(deter, u, g)
+        self.sp1 = nn.Sequential(
+            nn.Linear(flat_stoch, 2 * self.units), nn.RMSNorm(2 * self.units, eps=1e-04, dtype=torch.float32), act()
+        )
+        self.sp2 = nn.Linear(2 * self.units, math.prod(self.min_shape))
+        self.sp_norm = nn.Sequential(nn.RMSNorm(self.depths[-1], eps=1e-04, dtype=torch.float32), act())
+        layers = []
+        in_dim = self.depths[-1]
+        for depth in reversed(self.depths[:-1]):
+            layers.append(nn.ConvTranspose2d(in_dim, depth, kernel_size=4, stride=2, padding=1, bias=True))
+            layers.append(RMSNorm2D(depth, eps=1e-04, dtype=torch.float32))
+            layers.append(act())
+            in_dim = depth
+        layers.append(nn.ConvTranspose2d(in_dim, self._shape[0], kernel_size=4, stride=2, padding=1, bias=True))
+        self.layers = nn.Sequential(*layers)
+        self.apply(weight_init_)
+
+    def forward(self, stoch, deter):
+        B_T = deter.shape[:-1]
+        x0, x1 = deter.reshape(B_T.numel(), deter.shape[-1]), stoch.reshape(B_T.numel(), -1)
+        H_feat, W_feat, C_feat = self.min_shape
+        x0 = self.sp0(x0)
+        x0 = x0.reshape(-1, self.bspace, H_feat, W_feat, C_feat // self.bspace)
+        x0 = x0.permute(0, 2, 3, 1, 4).reshape(-1, H_feat, W_feat, C_feat)
+        x1 = self.sp1(x1)
+        x1 = self.sp2(x1).reshape(-1, H_feat, W_feat, C_feat)
+        x = self.sp_norm(x0 + x1)
+        x = x.permute(0, 3, 1, 2)
+        x = self.layers(x)
+        x = x.permute(0, 2, 3, 1)
+        x = torch.sigmoid(x)
         return x.reshape(*B_T, *x.shape[1:])
 
 

@@ -1,12 +1,12 @@
 act_entropy: 3e-4
-kl_free: 1.0
+kl_free: 1.5
 imag_horizon: 15
 horizon: 333
 lamb: 0.95
 compile: True
 log_grads: False
 device: ${device}
-rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro
+rep_loss: "r2dreamer" # r2dreamer/dreamer/infonce/dreamerpro/policy_supervised
 
 lr: 4e-5
 agc: 0.3
@@ -17,17 +17,24 @@ beta2: 0.999
 warmup: 1000
 slow_target_update: 1
 slow_target_fraction: 0.02
-train_reward: True
+
+train_wm_only: True
+reconstruct_reward: True
+reconstruct_img: True
+reconstruct_bev: True
 
 loss_scales:
-  barlow: 0.05
+  barlow: 0.02
   bc: 0.0
   infonce: 1.0
   recon: 1.0
+  recon_reward: 1.0
+  recon_img: 1.0
+  recon_bev: 1.0
   rew: 1.0
   con: 1.0
   dyn: 1.0
-  rep: 0.1
+  rep: 0.15
   policy: 1.0
   value: 1.0
   repval: 0.3
@@ -36,7 +43,7 @@ loss_scales:
   norm: 1.0
 
 r2dreamer:
-  lambd: 5e-4
+  lambd: 5e-3
 
 dreamer_pro:
   warm_up: 1
@@ -181,3 +188,16 @@ critic:
   outscale: 0.0
   symlog_inputs: False
   name: 'value'
+
+reward_verifier:
+  shape: [1,]
+  layers: 2
+  units: ${model.units}
+  act: ${model.act}
+  norm: ${model.norm}
+  device: ${device}
+  dist:
+    name: 'symlog_mse'
+  outscale: 0.0
+  symlog_inputs: False
+  name: 'reward_verifier'

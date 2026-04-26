@@ -57,6 +57,11 @@ def main(config):
                     for key in sorted(sample)
                     if key.startswith("reward_")
                 },
+                **(
+                    {"bev_image": gym.spaces.Box(0, 255, shape=tuple(sample["bev_image"].shape[1:]), dtype=np.uint8)}
+                    if "bev_image" in sample
+                    else {}
+                ),
             }
         )
         act_space = gym.spaces.Box(low=-1.0, high=1.0, shape=tuple(sample["action"].shape[1:]), dtype=np.float32)

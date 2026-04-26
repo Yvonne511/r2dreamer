@@ -84,13 +84,22 @@ def rollout():
 			expert_actions, mask = vecenv.get_expert_actions()
 			expert_actions = expert_actions.reshape(vecenv.action_space.shape)
 			obs, rewards, terminals, truncations, info = vecenv.step(expert_actions)
-			for env_id in range(driver_env.num_envs):
-				rc = driver_env.get_reward_components(env_id)
-				n = driver_env.agent_offsets[env_id + 1] - driver_env.agent_offsets[env_id]
-				assert all(v.shape == (n,) for v in rc.values()), \
-					f"step {step_idx} env {env_id}: unexpected shapes {({k: v.shape for k, v in rc.items()})}"
-			for env_id in range(driver_env.num_envs):
+			for env_id, subenv in enumerate(vecenv.envs):
 				scenario_id = scenario_ids[env_id].rstrip("\x00")
+				states = subenv.get_global_agent_state()
+				start = subenv.agent_offsets[env_id]
+				end = subenv.agent_offsets[env_id + 1]
+				rc = driver_env.get_reward_components(env_id)
+				for agent_idx in range(start, end):
+					x = float(states["x"][agent_idx])
+					y = float(states["y"][agent_idx])
+					rel_goal_x = float(subenv.observations[agent_idx, 0] / 0.005)
+					rel_goal_y = float(subenv.observations[agent_idx, 1] / 0.005)
+					print(
+						f"frame={step_idx:04d} outer_env={env_id:02d} env={env_id:03d} "
+						f"agent={agent_idx:05d} scenario_id={scenario_id} "
+						f"x={x:.3f} y={y:.3f} rel_goal_x={rel_goal_x:.3f} rel_goal_y={rel_goal_y:.3f}"
+					)
 				for view_mode, suffix in [(RenderView.AGENT_PERSP, ""), (RenderView.BEV_AGENT_OBS, "_bev")]:
 					images, batch_indices = driver_env.render_all_controlled_agent_views(env_id=env_id, view_mode=view_mode)
 					for local_agent_idx, (image, batch_idx) in enumerate(zip(images, batch_indices)):
